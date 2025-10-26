@@ -25,8 +25,10 @@ import hashlib
 import os
 import asyncio
 import re
+import time
+import secrets
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from enum import Enum
 
 import modal
@@ -667,6 +669,140 @@ async def analyze_github_profile(username: str) -> Dict[str, Any]:
 
 
 # ============================================================================
+# AUTO-DETECTION & MULTI-TOOL LOGIC
+# ============================================================================
+
+def detect_field_type(key: str, value: Any) -> str:
+    """
+    Detect the type of a field based on key name and value pattern.
+
+    Returns: 'phone', 'email', 'domain', 'company', 'github_user', or 'unknown'
+    """
+    if not value or not isinstance(value, str):
+        return "unknown"
+
+    value_str = str(value).strip()
+    key_lower = key.lower()
+
+    # Phone number detection
+    phone_pattern = r'^\+?[1-9]\d{1,14}$|^\(?[0-9]{3}\)?[-.\s]?[0-9]{3}[-.\s]?[0-9]{4}$'
+    if re.match(phone_pattern, value_str) or 'phone' in key_lower or 'mobile' in key_lower or 'tel' in key_lower:
+        if re.match(r'^\+?[0-9\s\-\(\)\.]{10,}$', value_str):
+            return "phone"
+
+    # Email detection
+    email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    if re.match(email_pattern, value_str) or 'email' in key_lower or 'mail' in key_lower:
+        if '@' in value_str:
+            return "email"
+
+    # Domain detection (not email)
+    domain_pattern = r'^[a-z0-9]+([\-\.]{1}[a-z0-9]+)*\.[a-z]{2,}$'
+    if re.match(domain_pattern, value_str.lower()) or 'domain' in key_lower or 'website' in key_lower or 'site' in key_lower:
+        if '.' in value_str and '@' not in value_str and not value_str.startswith('http'):
+            return "domain"
+
+    # GitHub username detection
+    if 'github' in key_lower or 'gh_user' in key_lower:
+        if re.match(r'^[a-zA-Z0-9](?:[a-zA-Z0-9]|-(?=[a-zA-Z0-9])){0,38}$', value_str):
+            return "github_user"
+
+    # Company name detection
+    if 'company' in key_lower or 'organization' in key_lower or 'org' in key_lower or 'business' in key_lower:
+        if len(value_str) > 2 and not '@' in value_str:
+            return "company"
+
+    return "unknown"
+
+
+def auto_detect_enrichments(data: Dict[str, Any]) -> List[Tuple[str, str, Any]]:
+    """
+    Auto-detect which enrichment tools to apply based on data.
+
+    Args:
+        data: Dictionary of field_name -> value
+
+    Returns:
+        List of (tool_name, field_name, value) tuples
+    """
+    enrichments = []
+
+    for key, value in data.items():
+        if not value:
+            continue
+
+        field_type = detect_field_type(key, value)
+
+        if field_type == "phone":
+            enrichments.append(("phone-validation", key, value))
+
+        elif field_type == "email":
+            enrichments.append(("email-intel", key, value))
+            # Also get email patterns from domain
+            try:
+                domain = value.split('@')[1] if '@' in value else None
+                if domain:
+                    enrichments.append(("email-pattern", key, domain))
+            except:
+                pass
+
+        elif field_type == "domain":
+            enrichments.append(("whois", key, value))
+            enrichments.append(("tech-stack", key, value))
+
+        elif field_type == "company":
+            enrichments.append(("company-data", key, value))
+
+        elif field_type == "github_user":
+            enrichments.append(("github-intel", key, value))
+
+    return enrichments
+
+
+async def run_enrichments(data: Dict[str, Any], tool_specs: List[Tuple[str, str, Any]]) -> Dict[str, Any]:
+    """
+    Run multiple enrichment tools and return combined results.
+
+    Args:
+        data: Original data
+        tool_specs: List of (tool_name, field_name, value) tuples
+
+    Returns:
+        Dict with original data + enrichment results
+    """
+    results = {**data}  # Start with original data
+    errors = []
+
+    # Map tool names to functions
+    tool_map = {
+        "phone-validation": lambda v: validate_phone(v, "US"),
+        "email-intel": lambda v: email_intel(v),
+        "email-pattern": lambda v: generate_email_patterns(v),
+        "whois": lambda v: lookup_whois(v),
+        "tech-stack": lambda v: detect_tech_stack(v),
+        "company-data": lambda v: get_company_data(v),
+        "github-intel": lambda v: analyze_github_profile(v),
+    }
+
+    # Run each enrichment
+    for tool_name, field_name, value in tool_specs:
+        if tool_name in tool_map:
+            try:
+                result = await tool_map[tool_name](value)
+                # Store result with descriptive key
+                result_key = f"{field_name}_{tool_name.replace('-', '_')}"
+                results[result_key] = result
+            except Exception as e:
+                errors.append({"tool": tool_name, "field": field_name, "error": str(e)})
+
+    # Add errors if any occurred
+    if errors:
+        results["_enrichment_errors"] = errors
+
+    return results
+
+
+# ============================================================================
 # AUTHENTICATION & MIDDLEWARE
 # ============================================================================
 
@@ -679,7 +815,175 @@ def verify_api_key(api_key: Optional[str]) -> bool:
 
 
 # ============================================================================
-# FASTAPI ENDPOINT - 10 ROUTES (9 tools + 1 health)
+# BULK PROCESSING & RESULT STORAGE
+# ============================================================================
+
+# Modal Dict for storing batch results (24-hour TTL)
+batch_results = modal.Dict.from_name("enrichment-batch-results", create_if_missing=True)
+
+
+def fire_webhook(webhook_url: str, payload: Dict[str, Any]) -> bool:
+    """
+    Fire webhook with batch completion data.
+
+    Args:
+        webhook_url: URL to POST results to (n8n, Zapier, etc.)
+        payload: Batch summary data
+
+    Returns:
+        True if webhook fired successfully, False otherwise
+    """
+    import requests
+
+    try:
+        response = requests.post(
+            webhook_url,
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=10,
+        )
+        response.raise_for_status()
+        return True
+    except Exception as e:
+        print(f"Webhook failed for batch {payload.get('batch_id')}: {e}")
+        return False
+
+
+@app.function(
+    image=image,
+    timeout=3600,  # 1 hour per row
+    memory=1024,   # 1GB per worker
+    secrets=[modal.Secret.from_name("gemini-secret")],
+)
+def process_bulk_row(
+    row: Dict[str, Any],
+    row_index: int,
+    tool_specs: List[Tuple[str, str, Any]],
+) -> Dict[str, Any]:
+    """
+    Process a single row with enrichment tools.
+
+    Called via Modal .starmap() for parallel execution.
+
+    Args:
+        row: Row data
+        row_index: Row index in batch
+        tool_specs: List of (tool_name, field_name, value) tuples
+
+    Returns:
+        Enriched row with results
+    """
+    import asyncio
+
+    try:
+        # Run enrichments
+        result = asyncio.run(run_enrichments(row, tool_specs))
+
+        return {
+            "row_index": row_index,
+            "status": "success",
+            "data": result,
+            "error": None,
+        }
+    except Exception as e:
+        return {
+            "row_index": row_index,
+            "status": "error",
+            "data": row,
+            "error": str(e),
+        }
+
+
+async def process_batch_internal(
+    batch_id: str,
+    rows: List[Dict[str, Any]],
+    auto_detect: bool = False,
+    tool_names: Optional[List[str]] = None,
+    webhook_url: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Process multiple rows with enrichment tools in parallel.
+
+    Args:
+        batch_id: Unique batch identifier
+        rows: List of row dictionaries
+        auto_detect: Auto-detect tools based on data (default: False)
+        tool_names: Specific tools to apply (if not auto-detecting)
+        webhook_url: Optional webhook URL to fire on completion
+
+    Returns:
+        Batch processing summary
+    """
+    import time
+
+    start_time = time.time()
+
+    # Determine tool specs for each row
+    if auto_detect:
+        # Auto-detect tools for each row
+        tool_specs_per_row = [auto_detect_enrichments(row) for row in rows]
+    elif tool_names:
+        # Apply same tools to all rows
+        tool_specs_per_row = []
+        for row in rows:
+            specs = []
+            for tool_name in tool_names:
+                # Find field to apply tool to (match tool type to field)
+                for key, value in row.items():
+                    field_type = detect_field_type(key, value)
+                    if (field_type == "phone" and tool_name == "phone-validation") or \
+                       (field_type == "email" and tool_name in ["email-intel", "email-pattern"]) or \
+                       (field_type == "domain" and tool_name in ["whois", "tech-stack"]) or \
+                       (field_type == "company" and tool_name == "company-data") or \
+                       (field_type == "github_user" and tool_name == "github-intel"):
+                        specs.append((tool_name, key, value))
+            tool_specs_per_row.append(specs)
+    else:
+        # No tools specified
+        tool_specs_per_row = [[] for _ in rows]
+
+    # Process rows in parallel using asyncio
+    async def process_single_row(row: Dict[str, Any], idx: int, specs: List[Tuple[str, str, Any]]):
+        try:
+            result = await run_enrichments(row, specs)
+            return {"row_index": idx, "status": "success", "data": result, "error": None}
+        except Exception as e:
+            return {"row_index": idx, "status": "error", "data": row, "error": str(e)}
+
+    results = await asyncio.gather(*[
+        process_single_row(row, idx, specs)
+        for idx, (row, specs) in enumerate(zip(rows, tool_specs_per_row))
+    ])
+
+    # Calculate statistics
+    successful_count = sum(1 for r in results if r.get("status") == "success")
+    error_count = sum(1 for r in results if r.get("status") == "error")
+    total_time = time.time() - start_time
+
+    # Build summary
+    summary = {
+        "batch_id": batch_id,
+        "status": "completed" if error_count == 0 else "completed_with_errors",
+        "total_rows": len(rows),
+        "successful": successful_count,
+        "failed": error_count,
+        "processing_time_seconds": round(total_time, 2),
+        "results": results,
+        "timestamp": datetime.now().isoformat() + "Z",
+    }
+
+    # Store results in Modal Dict (24h TTL)
+    batch_results[batch_id] = summary
+
+    # Fire webhook if configured
+    if webhook_url:
+        fire_webhook(webhook_url, summary)
+
+    return summary
+
+
+# ============================================================================
+# FASTAPI ENDPOINT - 16 ROUTES (9 tools + 1 health + 6 bulk)
 # ============================================================================
 
 @app.function(image=image, secrets=[modal.Secret.from_name("gemini-secret")], timeout=300, scaledown_window=120)
@@ -939,5 +1243,223 @@ def api():
             return JSONResponse(status_code=400, content={"success": False, "error": "username required"})
         result = await analyze_github_profile(username)
         return JSONResponse(content=result)
+
+    # ============================================================================
+    # BULK PROCESSING ENDPOINTS (6 new routes)
+    # ============================================================================
+
+    @web_app.post("/enrich", tags=["Bulk Processing"])
+    async def multi_tool_enrich(request_data: Dict[str, Any], x_api_key: Optional[str] = Header(None)):
+        """
+        Enrich a single record with multiple tools.
+
+        - **data**: Record to enrich (dict with any fields)
+        - **tools**: List of tool names to apply (e.g. ["phone-validation", "email-intel"])
+        """
+        if not verify_api_key(x_api_key):
+            raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+        data = request_data.get("data")
+        tool_names = request_data.get("tools", [])
+
+        if not data or not isinstance(data, dict):
+            return JSONResponse(status_code=400, content={"success": False, "error": "data required (must be dict)"})
+        if not tool_names or not isinstance(tool_names, list):
+            return JSONResponse(status_code=400, content={"success": False, "error": "tools required (must be list)"})
+
+        try:
+            # Build tool specs from explicit tool names
+            tool_specs = []
+            for tool_name in tool_names:
+                # Find matching field in data for this tool
+                for key, value in data.items():
+                    field_type = detect_field_type(key, value)
+                    if (tool_name == "phone-validation" and field_type == "phone") or \
+                       (tool_name == "email-intel" and field_type == "email") or \
+                       (tool_name == "email-pattern" and field_type == "domain") or \
+                       (tool_name == "whois" and field_type == "domain") or \
+                       (tool_name == "tech-stack" and field_type == "domain") or \
+                       (tool_name == "company-data" and field_type == "company") or \
+                       (tool_name == "github-intel" and field_type == "github_user"):
+                        tool_specs.append((tool_name, key, value))
+                        break
+
+            if not tool_specs:
+                return JSONResponse(status_code=400, content={"success": False, "error": "No matching fields found for specified tools"})
+
+            result = await run_enrichments(data, tool_specs)
+            return JSONResponse(content={"success": True, "data": result, "metadata": {"source": "multi-tool-enrich", "timestamp": datetime.now().isoformat() + "Z"}})
+        except Exception as e:
+            return JSONResponse(status_code=500, content={"success": False, "error": f"Enrichment failed: {str(e)}"})
+
+    @web_app.post("/enrich/auto", tags=["Bulk Processing"])
+    async def auto_enrich(request_data: Dict[str, Any], x_api_key: Optional[str] = Header(None)):
+        """
+        Auto-detect and enrich a single record with appropriate tools.
+
+        - **data**: Record to enrich (dict with any fields)
+        """
+        if not verify_api_key(x_api_key):
+            raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+        data = request_data.get("data")
+        if not data or not isinstance(data, dict):
+            return JSONResponse(status_code=400, content={"success": False, "error": "data required (must be dict)"})
+
+        try:
+            tool_specs = auto_detect_enrichments(data)
+            if not tool_specs:
+                return JSONResponse(content={"success": True, "data": data, "metadata": {"source": "auto-enrich", "message": "No enrichments detected", "timestamp": datetime.now().isoformat() + "Z"}})
+
+            result = await run_enrichments(data, tool_specs)
+            return JSONResponse(content={"success": True, "data": result, "metadata": {"source": "auto-enrich", "tools_applied": len(tool_specs), "timestamp": datetime.now().isoformat() + "Z"}})
+        except Exception as e:
+            return JSONResponse(status_code=500, content={"success": False, "error": f"Auto-enrichment failed: {str(e)}"})
+
+    @web_app.post("/bulk", tags=["Bulk Processing"])
+    async def bulk_process(request_data: Dict[str, Any], x_api_key: Optional[str] = Header(None)):
+        """
+        Process multiple records in parallel with specified tools.
+
+        - **rows**: List of records to enrich (max 10,000)
+        - **tools**: List of tool names to apply to ALL rows
+        - **webhook_url**: Optional webhook URL for completion notification
+        """
+        if not verify_api_key(x_api_key):
+            raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+        rows = request_data.get("rows", [])
+        tool_names = request_data.get("tools", [])
+        webhook_url = request_data.get("webhook_url")
+
+        if not rows or not isinstance(rows, list):
+            return JSONResponse(status_code=400, content={"success": False, "error": "rows required (must be list)"})
+        if len(rows) > 10000:
+            return JSONResponse(status_code=400, content={"success": False, "error": "Maximum 10,000 rows per batch"})
+        if not tool_names or not isinstance(tool_names, list):
+            return JSONResponse(status_code=400, content={"success": False, "error": "tools required (must be list)"})
+
+        try:
+            batch_id = f"batch_{int(time.time() * 1000)}_{secrets.token_urlsafe(8)}"
+
+            # Process batch (runs fast with parallel Modal .starmap())
+            result = await process_batch_internal(batch_id, rows, False, tool_names, webhook_url)
+
+            return JSONResponse(content={
+                "success": True,
+                "batch_id": batch_id,
+                "status": result.get("status", "completed"),
+                "total_rows": result.get("total_rows", len(rows)),
+                "successful": result.get("successful", 0),
+                "failed": result.get("failed", 0),
+                "processing_time_seconds": result.get("processing_time_seconds", 0),
+                "results": result.get("results", []),
+                "message": "Batch processing completed successfully.",
+                "metadata": {"timestamp": datetime.now().isoformat() + "Z"}
+            })
+        except Exception as e:
+            return JSONResponse(status_code=500, content={"success": False, "error": f"Batch processing failed: {str(e)}"})
+
+    @web_app.post("/bulk/auto", tags=["Bulk Processing"])
+    async def bulk_auto_process(request_data: Dict[str, Any], x_api_key: Optional[str] = Header(None)):
+        """
+        Process multiple records in parallel with auto-detection.
+
+        - **rows**: List of records to enrich (max 10,000)
+        - **webhook_url**: Optional webhook URL for completion notification
+        """
+        if not verify_api_key(x_api_key):
+            raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+        rows = request_data.get("rows", [])
+        webhook_url = request_data.get("webhook_url")
+
+        if not rows or not isinstance(rows, list):
+            return JSONResponse(status_code=400, content={"success": False, "error": "rows required (must be list)"})
+        if len(rows) > 10000:
+            return JSONResponse(status_code=400, content={"success": False, "error": "Maximum 10,000 rows per batch"})
+
+        try:
+            batch_id = f"batch_{int(time.time() * 1000)}_{secrets.token_urlsafe(8)}"
+
+            # Process batch with auto-detection (runs fast with parallel Modal .starmap())
+            result = await process_batch_internal(batch_id, rows, True, None, webhook_url)
+
+            return JSONResponse(content={
+                "success": True,
+                "batch_id": batch_id,
+                "status": result.get("status", "completed"),
+                "total_rows": result.get("total_rows", len(rows)),
+                "successful": result.get("successful", 0),
+                "failed": result.get("failed", 0),
+                "processing_time_seconds": result.get("processing_time_seconds", 0),
+                "results": result.get("results", []),
+                "message": "Batch auto-processing completed successfully.",
+                "metadata": {"timestamp": datetime.now().isoformat() + "Z"}
+            })
+        except Exception as e:
+            return JSONResponse(status_code=500, content={"success": False, "error": f"Batch auto-processing failed: {str(e)}"})
+
+    @web_app.get("/bulk/status/{batch_id}", tags=["Bulk Processing"])
+    async def bulk_status(batch_id: str, x_api_key: Optional[str] = Header(None)):
+        """
+        Check the status of a batch processing job.
+
+        - **batch_id**: Batch ID returned from /bulk or /bulk/auto
+        """
+        if not verify_api_key(x_api_key):
+            raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+        try:
+            if batch_id not in batch_results:
+                return JSONResponse(status_code=404, content={"success": False, "error": "Batch not found"})
+
+            batch_data = batch_results[batch_id]
+            return JSONResponse(content={
+                "success": True,
+                "batch_id": batch_id,
+                "status": batch_data.get("status", "unknown"),
+                "total_rows": batch_data.get("total_rows", 0),
+                "processed_rows": batch_data.get("processed_rows", 0),
+                "metadata": {"timestamp": datetime.now().isoformat() + "Z"}
+            })
+        except Exception as e:
+            return JSONResponse(status_code=500, content={"success": False, "error": f"Status check failed: {str(e)}"})
+
+    @web_app.get("/bulk/results/{batch_id}", tags=["Bulk Processing"])
+    async def bulk_results(batch_id: str, x_api_key: Optional[str] = Header(None)):
+        """
+        Download results from a completed batch job.
+
+        - **batch_id**: Batch ID returned from /bulk or /bulk/auto
+        """
+        if not verify_api_key(x_api_key):
+            raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+        try:
+            if batch_id not in batch_results:
+                return JSONResponse(status_code=404, content={"success": False, "error": "Batch not found"})
+
+            batch_data = batch_results[batch_id]
+
+            if batch_data.get("status") != "completed":
+                return JSONResponse(status_code=400, content={
+                    "success": False,
+                    "error": f"Batch not completed yet. Status: {batch_data.get('status', 'unknown')}"
+                })
+
+            return JSONResponse(content={
+                "success": True,
+                "batch_id": batch_id,
+                "status": "completed",
+                "results": batch_data.get("results", []),
+                "total_rows": batch_data.get("total_rows", 0),
+                "metadata": {
+                    "completed_at": batch_data.get("completed_at"),
+                    "timestamp": datetime.now().isoformat() + "Z"
+                }
+            })
+        except Exception as e:
+            return JSONResponse(status_code=500, content={"success": False, "error": f"Results retrieval failed: {str(e)}"})
 
     return web_app

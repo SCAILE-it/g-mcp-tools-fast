@@ -1,6 +1,6 @@
 # g-mcp-tools-fast - Production-Ready Enrichment API
 
-**Enterprise-grade data intelligence API with 9 powerful enrichment tools**
+**Enterprise-grade data intelligence API with 9 enrichment tools + bulk processing**
 
 🚀 **Status:** Production-Ready | SaaS-Ready | Fully Deployed
 🔗 **Live Endpoint:** `https://scaile--g-mcp-tools-fast-api.modal.run`
@@ -15,6 +15,9 @@ A complete data enrichment API built on Modal.com, combining AI-powered web scra
 ### Key Features
 
 ✅ **9 Enrichment Tools** - Web scraping, email intel, company data, phone validation, and more
+✅ **Bulk Processing** - Process 100s-1000s of records in parallel with auto-detection
+✅ **Smart Auto-Detection** - Automatically detect data types and apply appropriate tools
+✅ **Multi-Tool Enrichment** - Combine multiple tools on a single record
 ✅ **AI-Powered Extraction** - Uses Gemini 2.5 Flash for intelligent data extraction
 ✅ **Production-Ready** - Authentication, health checks, comprehensive error handling
 ✅ **Auto-Scaling** - Serverless architecture handles traffic spikes automatically
@@ -24,7 +27,99 @@ A complete data enrichment API built on Modal.com, combining AI-powered web scra
 
 ---
 
-## 🛠️ Available Tools
+## 🚀 Bulk Processing & Power Features
+
+**NEW:** Process multiple records in parallel with intelligent auto-detection!
+
+### Multi-Tool Enrichment (`/enrich`)
+
+Enrich a single record with multiple tools at once:
+
+```bash
+curl -X POST https://scaile--g-mcp-tools-fast-api.modal.run/enrich \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "data": {
+      "phone": "+14155552671",
+      "email": "john@anthropic.com"
+    },
+    "tools": ["phone-validation", "email-intel", "email-pattern"]
+  }'
+```
+
+### Auto-Detection (`/enrich/auto`)
+
+Automatically detect data types and apply appropriate tools:
+
+```bash
+curl -X POST https://scaile--g-mcp-tools-fast-api.modal.run/enrich/auto \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "data": {
+      "contact_phone": "+14155552671",
+      "work_email": "john@anthropic.com",
+      "company_domain": "anthropic.com"
+    }
+  }'
+```
+
+**Response:** Automatically detected and enriched with 5 tools (phone validation, email intel, email pattern, WHOIS, tech stack)!
+
+### Bulk Processing (`/bulk`)
+
+Process multiple records in parallel with explicit tools:
+
+```bash
+curl -X POST https://scaile--g-mcp-tools-fast-api.modal.run/bulk \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "rows": [
+      {"name": "Alice Johnson", "email": "alice@example.com"},
+      {"name": "Bob Smith", "email": "bob@example.com"}
+    ],
+    "tools": ["email-intel", "email-pattern"]
+  }'
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "batch_id": "batch_1761503726531_7AzCBh1nHak",
+  "status": "completed",
+  "total_rows": 2,
+  "successful": 2,
+  "failed": 0,
+  "processing_time_seconds": 1.24,
+  "results": [ /* enriched rows */ ]
+}
+```
+
+### Bulk Auto-Processing (`/bulk/auto`)
+
+Process multiple records with automatic tool detection:
+
+```bash
+curl -X POST https://scaile--g-mcp-tools-fast-api.modal.run/bulk/auto \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "rows": [
+      {"name": "Alice", "email": "alice@example.com", "website": "example.com"},
+      {"name": "Bob", "phone": "+14155551234"}
+    ]
+  }'
+```
+
+**Smart Features:**
+- ✅ Automatically detects emails, phones, domains, companies, GitHub usernames
+- ✅ Applies appropriate tools (email-intel, email-pattern, whois, tech-stack, etc.)
+- ✅ Processes rows in parallel using asyncio
+- ✅ Handles up to 10,000 rows per batch
+- ✅ Returns detailed success/error stats
+
+---
+
+## 🛠️ Individual Enrichment Tools
 
 ### 1. **Web Scraper** (`/scrape`)
 Extract structured data from any website using natural language prompts.
