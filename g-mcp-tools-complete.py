@@ -693,7 +693,14 @@ async def process_batch_internal(
         # No tools specified
         tool_specs_per_row = [[] for _ in rows]
 
-    # Process rows in parallel using asyncio
+    # HYBRID ROUTING: Choose processing mode based on batch size
+    PARALLEL_THRESHOLD = 100  # Use parallel workers for batches >= 100 rows
+
+    if len(rows) >= PARALLEL_THRESHOLD:
+        # Large batch: Use distributed parallel workers
+        return await process_batch_parallel(batch_id, rows, tool_specs_per_row, webhook_url)
+
+    # Small batch: Use async concurrent processing
     async def process_single_row(row: Dict[str, Any], idx: int, specs: List[Tuple[str, str, Any]]):
         try:
             result = await run_enrichments(row, specs)
@@ -706,12 +713,10 @@ async def process_batch_internal(
         for idx, (row, specs) in enumerate(zip(rows, tool_specs_per_row))
     ])
 
-    # Calculate statistics
     successful_count = sum(1 for r in results if r.get("status") == "success")
     error_count = sum(1 for r in results if r.get("status") == "error")
     total_time = time.time() - start_time
 
-    # Build summary
     summary = {
         "batch_id": batch_id,
         "status": "completed" if error_count == 0 else "completed_with_errors",
@@ -719,17 +724,63 @@ async def process_batch_internal(
         "successful": successful_count,
         "failed": error_count,
         "processing_time_seconds": round(total_time, 2),
+        "processing_mode": "async_concurrent",
         "results": results,
         "timestamp": datetime.now().isoformat() + "Z",
     }
 
-    # Store results in Modal Dict (24h TTL)
     batch_results[batch_id] = summary
-
-    # Fire webhook if configured
     if webhook_url:
         fire_webhook(webhook_url, summary)
 
+    return summary
+
+
+# PARALLEL WORKER for large batches (1000+ rows)
+@app.function(image=image, timeout=120)
+async def process_single_row_worker(row: Dict[str, Any], idx: int, specs: List[Tuple[str, str, Any]]) -> Dict[str, Any]:
+    """Modal worker function for parallel row processing"""
+    try:
+        result = await run_enrichments(row, specs)
+        return {"row_index": idx, "status": "success", "data": result, "error": None}
+    except Exception as e:
+        return {"row_index": idx, "status": "error", "data": row, "error": str(e)}
+
+
+async def process_batch_parallel(
+    batch_id: str,
+    rows: List[Dict[str, Any]],
+    tool_specs_per_row: List[List[Tuple[str, str, Any]]],
+    webhook_url: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Process large batches using distributed Modal workers"""
+    import time
+    start_time = time.time()
+
+    # Use Modal .starmap.aio() for true parallel processing across workers (async context)
+    results = [r async for r in process_single_row_worker.starmap.aio(
+        [(row, idx, specs) for idx, (row, specs) in enumerate(zip(rows, tool_specs_per_row))]
+    )]
+
+    successful_count = sum(1 for r in results if r.get("status") == "success")
+    error_count = sum(1 for r in results if r.get("status") == "error")
+    total_time = time.time() - start_time
+
+    summary = {
+        "batch_id": batch_id,
+        "status": "completed" if error_count == 0 else "completed_with_errors",
+        "total_rows": len(rows),
+        "successful": successful_count,
+        "failed": error_count,
+        "processing_time_seconds": round(total_time, 2),
+        "processing_mode": "parallel_workers",
+        "results": results,
+        "timestamp": datetime.now().isoformat() + "Z",
+    }
+
+    batch_results[batch_id] = summary
+    if webhook_url:
+        fire_webhook(webhook_url, summary)
     return summary
 
 
@@ -1001,6 +1052,7 @@ def api():
                 "successful": result.get("successful", 0),
                 "failed": result.get("failed", 0),
                 "processing_time_seconds": result.get("processing_time_seconds", 0),
+                "processing_mode": result.get("processing_mode", "unknown"),
                 "results": result.get("results", []),
                 "message": "Batch processing completed successfully.",
                 "metadata": {"timestamp": datetime.now().isoformat() + "Z"}
@@ -1041,6 +1093,7 @@ def api():
                 "successful": result.get("successful", 0),
                 "failed": result.get("failed", 0),
                 "processing_time_seconds": result.get("processing_time_seconds", 0),
+                "processing_mode": result.get("processing_mode", "unknown"),
                 "results": result.get("results", []),
                 "message": "Batch auto-processing completed successfully.",
                 "metadata": {"timestamp": datetime.now().isoformat() + "Z"}
