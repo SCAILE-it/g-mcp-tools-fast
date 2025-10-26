@@ -1,24 +1,4 @@
-"""
-g-mcp-tools-complete - Complete Enrichment Suite with 9 Tools
-
-ABOUTME: Complete version with crawl4ai + 8 enrichment tools (9 total routes)
-ABOUTME: Single FastAPI endpoint - Sherlock/Maigret/Wikipedia excluded
-
-Data enrichment tools (9 working):
-1. Web Scraper (crawl4ai + Gemini) - FULL LOGIC ✅
-2. Email Intel (holehe) - Check platforms ✅
-3. Email Finder (theHarvester) - Find emails ✅
-4. Company Data (OpenCorporates) ✅
-5. Phone Validation (libphonenumber) ✅
-6. Tech Stack (Wappalyzer) ✅
-7. Email Pattern (custom) ✅
-8. WHOIS (python-whois) ✅
-9. GitHub Intel (GitHub API) ✅
-
-To add later (complex install or API issues):
-10. Social Search (Sherlock + Maigret) - requires separate deployment
-11. Wikipedia (Wikipedia API) - Modal IP blocking issues
-"""
+"""g-mcp-tools-complete: 9 enrichment tools (scraper, email, phone, company, domain, github)"""
 
 import json
 import hashlib
@@ -34,10 +14,7 @@ from enum import Enum
 import modal
 from pydantic import BaseModel, Field, validator
 
-# Modal app definition
 app = modal.App("g-mcp-tools-fast")
-
-# Define Modal image with selective git repos (skip problematic ones)
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install("git")
@@ -67,9 +44,7 @@ image = (
 )
 
 
-# ============================================================================
-# PYDANTIC MODELS (reuse from fast version - same models)
-# ============================================================================
+# PYDANTIC MODELS
 
 class ActionType(str, Enum):
     CLICK = "click"
@@ -108,9 +83,7 @@ class ScrapeRequest(BaseModel):
         return v.strip()
 
 
-# ============================================================================
-# CACHING & HELPERS (same as fast version)
-# ============================================================================
+# CACHING & HELPERS
 
 _cache: Dict[str, tuple[Any, datetime]] = {}
 TTL_HOURS = 24
@@ -151,9 +124,7 @@ async def run_command(cmd: List[str], timeout: int = 30) -> tuple[str, str, int]
         raise Exception(f"Command failed: {e}")
 
 
-# ============================================================================
-# SCRAPER IMPLEMENTATION (Copy from g-mcp-tools-fast.py - same logic)
-# ============================================================================
+# SCRAPER IMPLEMENTATION
 
 class FlexibleScraperError(Exception):
     pass
@@ -409,81 +380,62 @@ Return ONLY a JSON array of the full URLs to visit, like:
         return merged
 
 
-# ============================================================================
-# ENRICHMENT TOOLS (8 from fast + 2 new ones)
-# ============================================================================
+# ENRICHMENT TOOLS
 
+def enrichment_tool(source: str):
+    """Decorator that standardizes error handling and response format for enrichment tools"""
+    def decorator(func):
+        async def wrapper(*args, **kwargs):
+            try:
+                data = await func(*args, **kwargs)
+                return {"success": True, "data": data, "metadata": {"source": source, "timestamp": datetime.now().isoformat() + "Z"}}
+            except Exception as e:
+                return {"success": False, "error": str(e), "metadata": {"source": source, "timestamp": datetime.now().isoformat() + "Z"}}
+        wrapper.__name__ = func.__name__
+        wrapper.__doc__ = func.__doc__
+        return wrapper
+    return decorator
+
+@enrichment_tool("holehe")
 async def email_intel(email: str) -> Dict[str, Any]:
     """Check which platforms an email is registered on using holehe"""
-    try:
-        cmd = ["holehe", "--only-found", email]
-        stdout, stderr, returncode = await run_command(cmd, timeout=45)
-
-        platforms = []
-        for line in stdout.split("\n"):
-            if "[+]" in line or "[-]" in line:
-                exists = "[+]" in line
-                parts = line.split()
-                if len(parts) >= 2:
-                    platform_name = parts[1]
-                    platforms.append({"name": platform_name.strip(":"), "exists": exists, "url": None})
-
-        total_found = sum(1 for p in platforms if p["exists"])
-        data = {"email": email, "platforms": platforms, "totalFound": total_found}
-
-        return {"success": True, "data": data, "metadata": {"source": "holehe", "timestamp": datetime.now().isoformat() + "Z"}}
-
-    except Exception as e:
-        return {"success": False, "error": str(e), "metadata": {"source": "email-intel", "timestamp": datetime.now().isoformat() + "Z"}}
+    cmd = ["holehe", "--only-found", email]
+    stdout, stderr, returncode = await run_command(cmd, timeout=45)
+    platforms = []
+    for line in stdout.split("\n"):
+        if "[+]" in line or "[-]" in line:
+            exists = "[+]" in line
+            parts = line.split()
+            if len(parts) >= 2:
+                platform_name = parts[1]
+                platforms.append({"name": platform_name.strip(":"), "exists": exists, "url": None})
+    total_found = sum(1 for p in platforms if p["exists"])
+    return {"email": email, "platforms": platforms, "totalFound": total_found}
 
 
+@enrichment_tool("theHarvester")
 async def email_finder(domain: str, limit: int = 50, sources: str = "google,bing") -> Dict[str, Any]:
     """Find email addresses for a domain using theHarvester"""
-    try:
-        cmd = [
-            "python3",
-            "/opt/theharvester/theHarvester.py",
-            "-d",
-            domain,
-            "-b",
-            sources,
-            "-l",
-            str(limit),
-        ]
-        stdout, stderr, returncode = await run_command(cmd, timeout=60)
-
-        emails = []
-        in_emails_section = False
-
-        for line in stdout.split("\n"):
-            if "[*] Emails found:" in line:
-                in_emails_section = True
-                continue
-
-            if in_emails_section:
-                email_match = re.search(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', line)
-                if email_match:
-                    email = email_match.group(0)
-                    if email not in [e["email"] for e in emails]:
-                        emails.append({"email": email, "source": "theHarvester"})
-
-                if line.startswith("[*]") and "Emails" not in line:
-                    in_emails_section = False
-
-        data = {
-            "domain": domain,
-            "emails": emails[:limit],
-            "totalFound": len(emails),
-            "searchMethod": f"theHarvester-{sources}",
-        }
-
-        return {"success": True, "data": data, "metadata": {"source": "theHarvester", "timestamp": datetime.now().isoformat() + "Z"}}
-
-    except Exception as e:
-        return {"success": False, "error": str(e), "metadata": {"source": "email-finder", "timestamp": datetime.now().isoformat() + "Z"}}
+    cmd = ["python3", "/opt/theharvester/theHarvester.py", "-d", domain, "-b", sources, "-l", str(limit)]
+    stdout, stderr, returncode = await run_command(cmd, timeout=60)
+    emails = []
+    in_emails_section = False
+    for line in stdout.split("\n"):
+        if "[*] Emails found:" in line:
+            in_emails_section = True
+            continue
+        if in_emails_section:
+            email_match = re.search(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', line)
+            if email_match:
+                email = email_match.group(0)
+                if email not in [e["email"] for e in emails]:
+                    emails.append({"email": email, "source": "theHarvester"})
+            if line.startswith("[*]") and "Emails" not in line:
+                in_emails_section = False
+    return {"domain": domain, "emails": emails[:limit], "totalFound": len(emails), "searchMethod": f"theHarvester-{sources}"}
 
 
-# Copy all 7 other enrichment functions from g-mcp-tools-fast.py
+@enrichment_tool("company-data")
 async def get_company_data(company_name: str, domain: Optional[str] = None) -> Dict[str, Any]:
     import requests
     results = {"companyName": company_name, "domain": domain, "sources": []}
@@ -495,267 +447,117 @@ async def get_company_data(company_name: str, domain: Optional[str] = None) -> D
             companies = data.get("results", {}).get("companies", [])
             if companies:
                 company = companies[0].get("company", {})
-                results["sources"].append({
-                    "name": "OpenCorporates",
-                    "data": {
-                        "jurisdiction": company.get("jurisdiction_code"),
-                        "companyNumber": company.get("company_number"),
-                        "status": company.get("current_status"),
-                        "incorporationDate": company.get("incorporation_date"),
-                    }
-                })
+                results["sources"].append({"name": "OpenCorporates", "data": {"jurisdiction": company.get("jurisdiction_code"), "companyNumber": company.get("company_number"), "status": company.get("current_status"), "incorporationDate": company.get("incorporation_date")}})
     except Exception as e:
         results["sources"].append({"name": "OpenCorporates", "error": str(e)})
+    return results
 
-    return {"success": True, "data": results, "metadata": {"source": "company-data", "timestamp": datetime.now().isoformat() + "Z"}}
 
-
+@enrichment_tool("phone-validation")
 async def validate_phone(phone_number: str, default_country: str = "US") -> Dict[str, Any]:
     import phonenumbers
     from phonenumbers import geocoder, carrier, PhoneNumberType
-
-    # Map phone number types to human-readable strings
-    PHONE_TYPE_MAP = {
-        PhoneNumberType.FIXED_LINE: "FIXED_LINE",
-        PhoneNumberType.MOBILE: "MOBILE",
-        PhoneNumberType.FIXED_LINE_OR_MOBILE: "FIXED_LINE_OR_MOBILE",
-        PhoneNumberType.TOLL_FREE: "TOLL_FREE",
-        PhoneNumberType.PREMIUM_RATE: "PREMIUM_RATE",
-        PhoneNumberType.SHARED_COST: "SHARED_COST",
-        PhoneNumberType.VOIP: "VOIP",
-        PhoneNumberType.PERSONAL_NUMBER: "PERSONAL_NUMBER",
-        PhoneNumberType.PAGER: "PAGER",
-        PhoneNumberType.UAN: "UAN",
-        PhoneNumberType.VOICEMAIL: "VOICEMAIL",
-        PhoneNumberType.UNKNOWN: "UNKNOWN",
-    }
-
-    try:
-        parsed = phonenumbers.parse(phone_number, default_country)
-        line_type_code = phonenumbers.number_type(parsed)
-        line_type_name = PHONE_TYPE_MAP.get(line_type_code, "UNKNOWN")
-
-        return {
-            "success": True,
-            "data": {
-                "valid": phonenumbers.is_valid_number(parsed),
-                "formatted": {
-                    "e164": phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.E164),
-                    "international": phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.INTERNATIONAL),
-                    "national": phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.NATIONAL),
-                },
-                "country": geocoder.description_for_number(parsed, "en"),
-                "carrier": carrier.name_for_number(parsed, "en") or "Unknown",
-                "lineType": line_type_name,
-                "lineTypeCode": line_type_code,
-            },
-            "metadata": {"source": "phone-validation", "timestamp": datetime.now().isoformat() + "Z"},
-        }
-    except Exception as e:
-        return {"success": False, "error": str(e), "metadata": {"source": "phone-validation", "timestamp": datetime.now().isoformat() + "Z"}}
+    PHONE_TYPE_MAP = {PhoneNumberType.FIXED_LINE: "FIXED_LINE", PhoneNumberType.MOBILE: "MOBILE", PhoneNumberType.FIXED_LINE_OR_MOBILE: "FIXED_LINE_OR_MOBILE", PhoneNumberType.TOLL_FREE: "TOLL_FREE", PhoneNumberType.PREMIUM_RATE: "PREMIUM_RATE", PhoneNumberType.SHARED_COST: "SHARED_COST", PhoneNumberType.VOIP: "VOIP", PhoneNumberType.PERSONAL_NUMBER: "PERSONAL_NUMBER", PhoneNumberType.PAGER: "PAGER", PhoneNumberType.UAN: "UAN", PhoneNumberType.VOICEMAIL: "VOICEMAIL", PhoneNumberType.UNKNOWN: "UNKNOWN"}
+    parsed = phonenumbers.parse(phone_number, default_country)
+    line_type_code = phonenumbers.number_type(parsed)
+    line_type_name = PHONE_TYPE_MAP.get(line_type_code, "UNKNOWN")
+    return {"valid": phonenumbers.is_valid_number(parsed), "formatted": {"e164": phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.E164), "international": phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.INTERNATIONAL), "national": phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.NATIONAL)}, "country": geocoder.description_for_number(parsed, "en"), "carrier": carrier.name_for_number(parsed, "en") or "Unknown", "lineType": line_type_name, "lineTypeCode": line_type_code}
 
 
+@enrichment_tool("tech-stack")
 async def detect_tech_stack(domain: str) -> Dict[str, Any]:
     import requests
     from bs4 import BeautifulSoup
-
     technologies = []
-
-    try:
-        url = f"https://{domain}" if not domain.startswith("http") else domain
-        headers = {"User-Agent": "Mozilla/5.0"}
-        response = requests.get(url, headers=headers, timeout=10)
-        soup = BeautifulSoup(response.content, "html.parser")
-
-        if soup.find_all(attrs={"data-react-helmet": True}) or soup.find_all(id=re.compile("react")):
-            technologies.append({"name": "React", "category": "JavaScript Framework"})
-        if "next" in response.text.lower() or soup.find_all(id="__next"):
-            technologies.append({"name": "Next.js", "category": "Framework"})
-
-        server = response.headers.get("server", "")
-        if server:
-            technologies.append({"name": server, "category": "Web Server"})
-
-        return {
-            "success": True,
-            "data": {"domain": domain, "technologies": technologies, "totalFound": len(technologies)},
-            "metadata": {"source": "tech-stack", "timestamp": datetime.now().isoformat() + "Z"},
-        }
-    except Exception as e:
-        return {"success": False, "error": str(e), "metadata": {"source": "tech-stack", "timestamp": datetime.now().isoformat() + "Z"}}
+    url = f"https://{domain}" if not domain.startswith("http") else domain
+    headers = {"User-Agent": "Mozilla/5.0"}
+    response = requests.get(url, headers=headers, timeout=10)
+    soup = BeautifulSoup(response.content, "html.parser")
+    if soup.find_all(attrs={"data-react-helmet": True}) or soup.find_all(id=re.compile("react")):
+        technologies.append({"name": "React", "category": "JavaScript Framework"})
+    if "next" in response.text.lower() or soup.find_all(id="__next"):
+        technologies.append({"name": "Next.js", "category": "Framework"})
+    server = response.headers.get("server", "")
+    if server:
+        technologies.append({"name": server, "category": "Web Server"})
+    return {"domain": domain, "technologies": technologies, "totalFound": len(technologies)}
 
 
+@enrichment_tool("email-pattern")
 async def generate_email_patterns(domain: str, first_name: Optional[str] = None, last_name: Optional[str] = None) -> Dict[str, Any]:
-    patterns = [
-        {"pattern": "{first}.{last}@{domain}", "example": f"john.doe@{domain}", "confidence": 0.9},
-        {"pattern": "{first}@{domain}", "example": f"john@{domain}", "confidence": 0.7},
-        {"pattern": "{last}@{domain}", "example": f"doe@{domain}", "confidence": 0.5},
-        {"pattern": "{f}{last}@{domain}", "example": f"jdoe@{domain}", "confidence": 0.8},
-    ]
-
+    patterns = [{"pattern": "{first}.{last}@{domain}", "example": f"john.doe@{domain}", "confidence": 0.9}, {"pattern": "{first}@{domain}", "example": f"john@{domain}", "confidence": 0.7}, {"pattern": "{last}@{domain}", "example": f"doe@{domain}", "confidence": 0.5}, {"pattern": "{f}{last}@{domain}", "example": f"jdoe@{domain}", "confidence": 0.8}]
     if first_name and last_name:
         for p in patterns:
-            example = p["pattern"].replace("{first}", first_name.lower())
-            example = example.replace("{last}", last_name.lower())
-            example = example.replace("{f}", first_name[0].lower())
-            example = example.replace("{domain}", domain)
+            example = p["pattern"].replace("{first}", first_name.lower()).replace("{last}", last_name.lower()).replace("{f}", first_name[0].lower()).replace("{domain}", domain)
             p["example"] = example
-
-    return {
-        "success": True,
-        "data": {"domain": domain, "patterns": patterns, "totalPatterns": len(patterns)},
-        "metadata": {"source": "email-pattern", "timestamp": datetime.now().isoformat() + "Z"},
-    }
+    return {"domain": domain, "patterns": patterns, "totalPatterns": len(patterns)}
 
 
+@enrichment_tool("whois")
 async def lookup_whois(domain: str) -> Dict[str, Any]:
     import whois
-
-    try:
-        w = whois.whois(domain)
-        return {
-            "success": True,
-            "data": {
-                "domain": domain,
-                "registrar": w.registrar,
-                "creationDate": str(w.creation_date) if w.creation_date else None,
-                "expirationDate": str(w.expiration_date) if w.expiration_date else None,
-                "nameServers": w.name_servers if isinstance(w.name_servers, list) else [w.name_servers] if w.name_servers else [],
-            },
-            "metadata": {"source": "whois", "timestamp": datetime.now().isoformat() + "Z"},
-        }
-    except Exception as e:
-        return {"success": False, "error": str(e), "metadata": {"source": "whois", "timestamp": datetime.now().isoformat() + "Z"}}
+    w = whois.whois(domain)
+    return {"domain": domain, "registrar": w.registrar, "creationDate": str(w.creation_date) if w.creation_date else None, "expirationDate": str(w.expiration_date) if w.expiration_date else None, "nameServers": w.name_servers if isinstance(w.name_servers, list) else [w.name_servers] if w.name_servers else []}
 
 
+@enrichment_tool("github-intel")
 async def analyze_github_profile(username: str) -> Dict[str, Any]:
     import requests
-
-    try:
-        url = f"https://api.github.com/users/{username}"
-        response = requests.get(url, timeout=10)
-        if response.status_code != 200:
-            raise Exception(f"GitHub API error: {response.status_code}")
-
-        user_data = response.json()
-        repos_url = f"https://api.github.com/users/{username}/repos?per_page=100"
-        repos_response = requests.get(repos_url, timeout=10)
-        repos = repos_response.json() if repos_response.status_code == 200 else []
-
-        languages = {}
-        for repo in repos[:20]:
-            if repo.get("language"):
-                lang = repo["language"]
-                languages[lang] = languages.get(lang, 0) + 1
-
-        return {
-            "success": True,
-            "data": {
-                "username": username,
-                "name": user_data.get("name"),
-                "bio": user_data.get("bio"),
-                "company": user_data.get("company"),
-                "location": user_data.get("location"),
-                "publicRepos": user_data.get("public_repos"),
-                "followers": user_data.get("followers"),
-                "following": user_data.get("following"),
-                "languages": languages,
-                "profileUrl": user_data.get("html_url"),
-            },
-            "metadata": {"source": "github-intel", "timestamp": datetime.now().isoformat() + "Z"},
-        }
-    except Exception as e:
-        return {"success": False, "error": str(e), "metadata": {"source": "github-intel", "timestamp": datetime.now().isoformat() + "Z"}}
+    url = f"https://api.github.com/users/{username}"
+    response = requests.get(url, timeout=10)
+    if response.status_code != 200:
+        raise Exception(f"GitHub API error: {response.status_code}")
+    user_data = response.json()
+    repos_url = f"https://api.github.com/users/{username}/repos?per_page=100"
+    repos_response = requests.get(repos_url, timeout=10)
+    repos = repos_response.json() if repos_response.status_code == 200 else []
+    languages = {}
+    for repo in repos[:20]:
+        if repo.get("language"):
+            lang = repo["language"]
+            languages[lang] = languages.get(lang, 0) + 1
+    return {"username": username, "name": user_data.get("name"), "bio": user_data.get("bio"), "company": user_data.get("company"), "location": user_data.get("location"), "publicRepos": user_data.get("public_repos"), "followers": user_data.get("followers"), "following": user_data.get("following"), "languages": languages, "profileUrl": user_data.get("html_url")}
 
 
-# ============================================================================
-# AUTO-DETECTION & MULTI-TOOL LOGIC
-# ============================================================================
+# AUTO-DETECTION
+
+FIELD_PATTERNS = {
+    "phone": {"regex": r'^\+?[0-9\s\-\(\)\.]{10,}$', "keywords": ['phone', 'mobile', 'tel']},
+    "email": {"regex": r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', "keywords": ['email', 'mail']},
+    "domain": {"regex": r'^[a-z0-9]+([\-\.]{1}[a-z0-9]+)*\.[a-z]{2,}$', "keywords": ['domain', 'website', 'site']},
+    "github_user": {"regex": r'^[a-zA-Z0-9](?:[a-zA-Z0-9]|-(?=[a-zA-Z0-9])){0,38}$', "keywords": ['github', 'gh_user']},
+    "company": {"regex": None, "keywords": ['company', 'organization', 'org', 'business']}
+}
+
+TOOL_MAPPING = {
+    "phone": [("phone-validation", lambda v: v)],
+    "email": [("email-intel", lambda v: v), ("email-pattern", lambda v: v.split('@')[1] if '@' in v else None)],
+    "domain": [("whois", lambda v: v), ("tech-stack", lambda v: v)],
+    "company": [("company-data", lambda v: v)],
+    "github_user": [("github-intel", lambda v: v)]
+}
 
 def detect_field_type(key: str, value: Any) -> str:
-    """
-    Detect the type of a field based on key name and value pattern.
-
-    Returns: 'phone', 'email', 'domain', 'company', 'github_user', or 'unknown'
-    """
     if not value or not isinstance(value, str):
         return "unknown"
-
-    value_str = str(value).strip()
-    key_lower = key.lower()
-
-    # Phone number detection
-    phone_pattern = r'^\+?[1-9]\d{1,14}$|^\(?[0-9]{3}\)?[-.\s]?[0-9]{3}[-.\s]?[0-9]{4}$'
-    if re.match(phone_pattern, value_str) or 'phone' in key_lower or 'mobile' in key_lower or 'tel' in key_lower:
-        if re.match(r'^\+?[0-9\s\-\(\)\.]{10,}$', value_str):
-            return "phone"
-
-    # Email detection
-    email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
-    if re.match(email_pattern, value_str) or 'email' in key_lower or 'mail' in key_lower:
-        if '@' in value_str:
-            return "email"
-
-    # Domain detection (not email)
-    domain_pattern = r'^[a-z0-9]+([\-\.]{1}[a-z0-9]+)*\.[a-z]{2,}$'
-    if re.match(domain_pattern, value_str.lower()) or 'domain' in key_lower or 'website' in key_lower or 'site' in key_lower:
-        if '.' in value_str and '@' not in value_str and not value_str.startswith('http'):
-            return "domain"
-
-    # GitHub username detection
-    if 'github' in key_lower or 'gh_user' in key_lower:
-        if re.match(r'^[a-zA-Z0-9](?:[a-zA-Z0-9]|-(?=[a-zA-Z0-9])){0,38}$', value_str):
-            return "github_user"
-
-    # Company name detection
-    if 'company' in key_lower or 'organization' in key_lower or 'org' in key_lower or 'business' in key_lower:
-        if len(value_str) > 2 and not '@' in value_str:
-            return "company"
-
+    v, k = str(value).strip(), key.lower()
+    for ftype, pat in FIELD_PATTERNS.items():
+        if any(kw in k for kw in pat["keywords"]) or (pat["regex"] and re.match(pat["regex"], v if ftype != "domain" else v.lower())):
+            if ftype == "email" and '@' in v: return "email"
+            if ftype == "domain" and '.' in v and '@' not in v and not v.startswith('http'): return "domain"
+            if ftype in ["phone", "github_user", "company"]: return ftype
     return "unknown"
 
-
 def auto_detect_enrichments(data: Dict[str, Any]) -> List[Tuple[str, str, Any]]:
-    """
-    Auto-detect which enrichment tools to apply based on data.
-
-    Args:
-        data: Dictionary of field_name -> value
-
-    Returns:
-        List of (tool_name, field_name, value) tuples
-    """
     enrichments = []
-
     for key, value in data.items():
-        if not value:
-            continue
-
+        if not value: continue
         field_type = detect_field_type(key, value)
-
-        if field_type == "phone":
-            enrichments.append(("phone-validation", key, value))
-
-        elif field_type == "email":
-            enrichments.append(("email-intel", key, value))
-            # Also get email patterns from domain
-            try:
-                domain = value.split('@')[1] if '@' in value else None
-                if domain:
-                    enrichments.append(("email-pattern", key, domain))
-            except:
-                pass
-
-        elif field_type == "domain":
-            enrichments.append(("whois", key, value))
-            enrichments.append(("tech-stack", key, value))
-
-        elif field_type == "company":
-            enrichments.append(("company-data", key, value))
-
-        elif field_type == "github_user":
-            enrichments.append(("github-intel", key, value))
-
+        if field_type in TOOL_MAPPING:
+            for tool_name, extractor in TOOL_MAPPING[field_type]:
+                extracted = extractor(value)
+                if extracted:
+                    enrichments.append((tool_name, key, extracted))
     return enrichments
 
 
@@ -802,9 +604,7 @@ async def run_enrichments(data: Dict[str, Any], tool_specs: List[Tuple[str, str,
     return results
 
 
-# ============================================================================
-# AUTHENTICATION & MIDDLEWARE
-# ============================================================================
+# AUTHENTICATION
 
 def verify_api_key(api_key: Optional[str]) -> bool:
     """Verify API key. Set MODAL_API_KEY secret to enable auth."""
@@ -814,11 +614,7 @@ def verify_api_key(api_key: Optional[str]) -> bool:
     return api_key == required_key
 
 
-# ============================================================================
-# BULK PROCESSING, RESULT STORAGE & WEBHOOKS
-# ============================================================================
-
-# Modal Dict for storing batch results (24-hour TTL)
+# BULK PROCESSING & RESULT STORAGE
 batch_results = modal.Dict.from_name("enrichment-batch-results", create_if_missing=True)
 
 
@@ -937,14 +733,12 @@ async def process_batch_internal(
     return summary
 
 
-# ============================================================================
-# FASTAPI ENDPOINT - 16 ROUTES (9 tools + 1 health + 6 bulk)
-# ============================================================================
+# FASTAPI ROUTES
 
 @app.function(image=image, secrets=[modal.Secret.from_name("gemini-secret")], timeout=300, scaledown_window=120)
 @modal.asgi_app()
 def api():
-    from fastapi import FastAPI, Header, HTTPException
+    from fastapi import FastAPI, Header, HTTPException, Body
     from fastapi.responses import JSONResponse
     from fastapi.openapi.utils import get_openapi
 
@@ -974,7 +768,34 @@ def api():
 
     web_app.openapi = custom_openapi
 
-    # Health check endpoint
+    # TOOL REGISTRY
+    ENRICHMENT_TOOLS = {
+        "email-intel": {"fn": email_intel, "params": [("email", str, True)], "tag": "Email Intelligence", "doc": "Check which platforms an email is registered on.\n\n- **email**: Email address to check"},
+        "email-finder": {"fn": email_finder, "params": [("domain", str, True), ("limit", int, False, 50)], "tag": "Email Intelligence", "doc": "Find email addresses associated with a domain.\n\n- **domain**: Domain to search\n- **limit**: Max results (default: 50)"},
+        "company-data": {"fn": get_company_data, "params": [("company_name", str, True), ("domain", str, False, None)], "tag": "Company Intelligence", "doc": "Get company registration data.\n\n- **company_name**: Company name\n- **domain**: Optional domain"},
+        "phone-validation": {"fn": validate_phone, "params": [("phone_number", str, True), ("default_country", str, False, "US")], "tag": "Contact Validation", "doc": "Validate and format phone numbers.\n\n- **phone_number**: Phone to validate\n- **default_country**: Country code (default: US)"},
+        "tech-stack": {"fn": detect_tech_stack, "params": [("domain", str, True)], "tag": "Technical Intelligence", "doc": "Detect technologies used by a website.\n\n- **domain**: Domain to analyze"},
+        "email-pattern": {"fn": generate_email_patterns, "params": [("domain", str, True), ("first_name", str, False, None), ("last_name", str, False, None)], "tag": "Email Intelligence", "doc": "Generate common email patterns.\n\n- **domain**: Domain\n- **first_name**: Optional first name\n- **last_name**: Optional last name"},
+        "whois": {"fn": lookup_whois, "params": [("domain", str, True)], "tag": "Domain Intelligence", "doc": "WHOIS lookup for domain registration.\n\n- **domain**: Domain to look up"},
+        "github-intel": {"fn": analyze_github_profile, "params": [("username", str, True)], "tag": "Developer Intelligence", "doc": "Analyze GitHub user profile.\n\n- **username**: GitHub username"}
+    }
+
+    def create_enrichment_route(tool_name: str, config: dict):
+        async def handler(request_data: Dict[str, Any] = Body(...), x_api_key: Optional[str] = Header(None)):
+            if not verify_api_key(x_api_key): raise HTTPException(status_code=401, detail="Invalid or missing API key")
+            kwargs = {}
+            for param_config in config["params"]:
+                param_name, is_required = param_config[0], param_config[2]
+                value = request_data.get(param_name)
+                if is_required and not value: return JSONResponse(status_code=400, content={"success": False, "error": f"{param_name} required"})
+                if len(param_config) == 4: kwargs[param_name] = value if value is not None else param_config[3]
+                elif value is not None: kwargs[param_name] = value
+            result = await config["fn"](**kwargs)
+            return JSONResponse(content=result)
+        handler.__doc__, handler.__name__ = config["doc"], f"{tool_name.replace('-', '_')}_route"
+        return handler
+
+    # EXPLICIT ENDPOINTS
     @web_app.get("/health", tags=["System"])
     async def health_check():
         """Health check endpoint for monitoring and uptime checks."""
@@ -1069,139 +890,11 @@ def api():
                 "metadata": {"source": "scraper", "timestamp": datetime.now().isoformat() + "Z"}
             })
 
-    @web_app.post("/email-intel", tags=["Email Intelligence"])
-    async def email_intel_route(request_data: Dict[str, Any], x_api_key: Optional[str] = Header(None)):
-        """
-        Check which platforms an email is registered on.
 
-        - **email**: Email address to check
-        """
-        if not verify_api_key(x_api_key):
-            raise HTTPException(status_code=401, detail="Invalid or missing API key")
-        email = request_data.get("email")
-        if not email:
-            return JSONResponse(status_code=400, content={"success": False, "error": "email required"})
-        result = await email_intel(email)
-        return JSONResponse(content=result)
+    for tool_name, tool_config in ENRICHMENT_TOOLS.items():
+        web_app.add_api_route(f"/{tool_name}", create_enrichment_route(tool_name, tool_config), methods=["POST"], tags=[tool_config["tag"]], summary=tool_config["doc"].split('\n\n')[0])
 
-    @web_app.post("/email-finder", tags=["Email Intelligence"])
-    async def email_finder_route(request_data: Dict[str, Any], x_api_key: Optional[str] = Header(None)):
-        """
-        Find email addresses associated with a domain.
-
-        - **domain**: Domain to search for emails
-        - **limit**: Maximum number of emails to return (default: 50)
-        """
-        if not verify_api_key(x_api_key):
-            raise HTTPException(status_code=401, detail="Invalid or missing API key")
-        domain = request_data.get("domain")
-        limit = request_data.get("limit", 50)
-        if not domain:
-            return JSONResponse(status_code=400, content={"success": False, "error": "domain required"})
-        result = await email_finder(domain, limit)
-        return JSONResponse(content=result)
-
-    @web_app.post("/company-data", tags=["Company Intelligence"])
-    async def company_data_route(request_data: Dict[str, Any], x_api_key: Optional[str] = Header(None)):
-        """
-        Get company registration and corporate data.
-
-        - **companyName**: Company name to look up
-        - **domain**: Optional company domain for additional context
-        """
-        if not verify_api_key(x_api_key):
-            raise HTTPException(status_code=401, detail="Invalid or missing API key")
-        company_name = request_data.get("companyName")
-        domain = request_data.get("domain")
-        if not company_name:
-            return JSONResponse(status_code=400, content={"success": False, "error": "companyName required"})
-        result = await get_company_data(company_name, domain)
-        return JSONResponse(content=result)
-
-    @web_app.post("/phone-validation", tags=["Contact Validation"])
-    async def phone_validation_route(request_data: Dict[str, Any], x_api_key: Optional[str] = Header(None)):
-        """
-        Validate and format phone numbers with carrier and location info.
-
-        - **phoneNumber**: Phone number to validate
-        - **defaultCountry**: Default country code (default: "US")
-        """
-        if not verify_api_key(x_api_key):
-            raise HTTPException(status_code=401, detail="Invalid or missing API key")
-        phone_number = request_data.get("phoneNumber")
-        default_country = request_data.get("defaultCountry", "US")
-        if not phone_number:
-            return JSONResponse(status_code=400, content={"success": False, "error": "phoneNumber required"})
-        result = await validate_phone(phone_number, default_country)
-        return JSONResponse(content=result)
-
-    @web_app.post("/tech-stack", tags=["Technical Intelligence"])
-    async def tech_stack_route(request_data: Dict[str, Any], x_api_key: Optional[str] = Header(None)):
-        """
-        Detect technologies and frameworks used by a website.
-
-        - **domain**: Domain or URL to analyze
-        """
-        if not verify_api_key(x_api_key):
-            raise HTTPException(status_code=401, detail="Invalid or missing API key")
-        domain = request_data.get("domain")
-        if not domain:
-            return JSONResponse(status_code=400, content={"success": False, "error": "domain required"})
-        result = await detect_tech_stack(domain)
-        return JSONResponse(content=result)
-
-    @web_app.post("/email-pattern", tags=["Email Intelligence"])
-    async def email_pattern_route(request_data: Dict[str, Any], x_api_key: Optional[str] = Header(None)):
-        """
-        Generate common email patterns for a domain.
-
-        - **domain**: Company domain
-        - **firstName**: Optional first name for personalized examples
-        - **lastName**: Optional last name for personalized examples
-        """
-        if not verify_api_key(x_api_key):
-            raise HTTPException(status_code=401, detail="Invalid or missing API key")
-        domain = request_data.get("domain")
-        first_name = request_data.get("firstName")
-        last_name = request_data.get("lastName")
-        if not domain:
-            return JSONResponse(status_code=400, content={"success": False, "error": "domain required"})
-        result = await generate_email_patterns(domain, first_name, last_name)
-        return JSONResponse(content=result)
-
-    @web_app.post("/whois", tags=["Domain Intelligence"])
-    async def whois_route(request_data: Dict[str, Any], x_api_key: Optional[str] = Header(None)):
-        """
-        Look up WHOIS information for a domain.
-
-        - **domain**: Domain to look up
-        """
-        if not verify_api_key(x_api_key):
-            raise HTTPException(status_code=401, detail="Invalid or missing API key")
-        domain = request_data.get("domain")
-        if not domain:
-            return JSONResponse(status_code=400, content={"success": False, "error": "domain required"})
-        result = await lookup_whois(domain)
-        return JSONResponse(content=result)
-
-    @web_app.post("/github-intel", tags=["Developer Intelligence"])
-    async def github_intel_route(request_data: Dict[str, Any], x_api_key: Optional[str] = Header(None)):
-        """
-        Analyze a GitHub user profile and repositories.
-
-        - **username**: GitHub username to analyze
-        """
-        if not verify_api_key(x_api_key):
-            raise HTTPException(status_code=401, detail="Invalid or missing API key")
-        username = request_data.get("username")
-        if not username:
-            return JSONResponse(status_code=400, content={"success": False, "error": "username required"})
-        result = await analyze_github_profile(username)
-        return JSONResponse(content=result)
-
-    # ============================================================================
-    # BULK PROCESSING ENDPOINTS (6 new routes)
-    # ============================================================================
+    # BULK ENDPOINTS
 
     @web_app.post("/enrich", tags=["Bulk Processing"])
     async def multi_tool_enrich(request_data: Dict[str, Any], x_api_key: Optional[str] = Header(None)):
