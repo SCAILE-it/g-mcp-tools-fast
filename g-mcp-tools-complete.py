@@ -1375,7 +1375,9 @@ def api():
                 "batch_id": batch_id,
                 "status": batch_data.get("status", "unknown"),
                 "total_rows": batch_data.get("total_rows", 0),
-                "processed_rows": batch_data.get("processed_rows", 0),
+                "successful": batch_data.get("successful", 0),
+                "failed": batch_data.get("failed", 0),
+                "processing_time_seconds": batch_data.get("processing_time_seconds", 0),
                 "metadata": {"timestamp": datetime.now().isoformat() + "Z"}
             })
         except Exception as e:
