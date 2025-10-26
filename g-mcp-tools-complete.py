@@ -815,7 +815,7 @@ def verify_api_key(api_key: Optional[str]) -> bool:
 
 
 # ============================================================================
-# BULK PROCESSING & RESULT STORAGE
+# BULK PROCESSING, RESULT STORAGE & WEBHOOKS
 # ============================================================================
 
 # Modal Dict for storing batch results (24-hour TTL)
@@ -847,51 +847,6 @@ def fire_webhook(webhook_url: str, payload: Dict[str, Any]) -> bool:
     except Exception as e:
         print(f"Webhook failed for batch {payload.get('batch_id')}: {e}")
         return False
-
-
-@app.function(
-    image=image,
-    timeout=3600,  # 1 hour per row
-    memory=1024,   # 1GB per worker
-    secrets=[modal.Secret.from_name("gemini-secret")],
-)
-def process_bulk_row(
-    row: Dict[str, Any],
-    row_index: int,
-    tool_specs: List[Tuple[str, str, Any]],
-) -> Dict[str, Any]:
-    """
-    Process a single row with enrichment tools.
-
-    Called via Modal .starmap() for parallel execution.
-
-    Args:
-        row: Row data
-        row_index: Row index in batch
-        tool_specs: List of (tool_name, field_name, value) tuples
-
-    Returns:
-        Enriched row with results
-    """
-    import asyncio
-
-    try:
-        # Run enrichments
-        result = asyncio.run(run_enrichments(row, tool_specs))
-
-        return {
-            "row_index": row_index,
-            "status": "success",
-            "data": result,
-            "error": None,
-        }
-    except Exception as e:
-        return {
-            "row_index": row_index,
-            "status": "error",
-            "data": row,
-            "error": str(e),
-        }
 
 
 async def process_batch_internal(
