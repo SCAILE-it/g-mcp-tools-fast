@@ -2947,20 +2947,37 @@ def api():
             if stream_mode:
                 async def event_generator():
                     """Generate SSE events from orchestrator stream."""
+                    final_result = None
                     try:
                         async for event in orchestrator.execute_plan_stream(user_request):
-                            # Format as SSE event
                             event_type = event.get("event", "message")
                             event_data = event.get("data", {})
 
-                            # SSE format: event: [type]\ndata: [json]\n\n
+                            # Track final result for logging
+                            if event_type == "complete":
+                                final_result = event_data
+
                             sse_message = f"event: {event_type}\ndata: {json.dumps(event_data)}\n\n"
                             yield sse_message
 
                     except Exception as e:
-                        # Send error event
                         error_event = f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
                         yield error_event
+                        final_result = {"error": str(e), "successful": 0, "failed": 0}
+
+                    finally:
+                        # Log usage for authenticated users after streaming completes
+                        if user_id and final_result:
+                            log_api_call(
+                                user_id=user_id,
+                                tool_name="orchestrator",
+                                tool_type="ai_orchestration",
+                                input_data={"user_request": user_request, "stream": True},
+                                output_data=final_result,
+                                success=final_result.get("successful", 0) > 0,
+                                processing_ms=0,
+                                error_message=final_result.get("error")
+                            )
 
                 return StreamingResponse(
                     event_generator(),
@@ -2968,7 +2985,7 @@ def api():
                     headers={
                         "Cache-Control": "no-cache",
                         "Connection": "keep-alive",
-                        "X-Accel-Buffering": "no"  # Disable nginx buffering
+                        "X-Accel-Buffering": "no"
                     }
                 )
 
