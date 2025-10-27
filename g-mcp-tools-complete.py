@@ -798,6 +798,248 @@ class ToolExecutor:
         return kwargs
 
 
+# ============================================================================
+# PHASE 3.3: ERROR HANDLER - INTELLIGENT ERROR RECOVERY
+# ============================================================================
+
+class ErrorCategory(str, Enum):
+    """
+    Error categories for classification and retry decisions.
+
+    - TRANSIENT: Temporary errors (network timeouts, service unavailable)
+    - RATE_LIMIT: Rate limiting errors (429, need exponential backoff)
+    - PERMANENT: Permanent errors (400, 401, 404, invalid params)
+    - UNKNOWN: Unknown errors (default to no retry)
+    """
+    TRANSIENT = "transient"
+    RATE_LIMIT = "rate_limit"
+    PERMANENT = "permanent"
+    UNKNOWN = "unknown"
+
+
+class ErrorClassifier:
+    """
+    Classifies errors into categories for intelligent retry decisions.
+
+    Follows Single Responsibility Principle: Only handles error categorization.
+    Static methods for stateless classification.
+    """
+
+    @staticmethod
+    def categorize(error: Exception) -> ErrorCategory:
+        """
+        Categorize an error into TRANSIENT, RATE_LIMIT, PERMANENT, or UNKNOWN.
+
+        Args:
+            error: Exception to categorize
+
+        Returns:
+            ErrorCategory enum value
+        """
+        import requests
+
+        error_str = str(error).lower()
+        error_type = type(error).__name__
+
+        # Check for transient network errors
+        if isinstance(error, (
+            asyncio.TimeoutError,
+            requests.exceptions.Timeout,
+            requests.exceptions.ConnectionError
+        )):
+            return ErrorCategory.TRANSIENT
+
+        # Check for HTTP errors in error message
+        if "http error" in error_str or "status code" in error_str:
+            # Rate limiting
+            if "429" in error_str or "rate limit" in error_str:
+                return ErrorCategory.RATE_LIMIT
+
+            # Transient server errors
+            if any(code in error_str for code in ["503", "504", "502"]):
+                return ErrorCategory.TRANSIENT
+
+            # Permanent client errors
+            if any(code in error_str for code in ["400", "401", "403", "404", "405"]):
+                return ErrorCategory.PERMANENT
+
+        # Check for permanent validation errors
+        if isinstance(error, ValueError):
+            return ErrorCategory.PERMANENT
+
+        # Check for timeout in message
+        if "timeout" in error_str or "timed out" in error_str:
+            return ErrorCategory.TRANSIENT
+
+        # Default to unknown (no retry)
+        return ErrorCategory.UNKNOWN
+
+
+from dataclasses import dataclass, field
+
+@dataclass
+class RetryConfig:
+    """
+    Configuration for retry behavior.
+
+    Immutable dataclass for type safety and clarity.
+    Follows Open/Closed Principle: Can extend without modifying existing code.
+    """
+    max_retries: int = 3
+    initial_delay: float = 1.0      # seconds
+    backoff_factor: float = 2.0     # exponential backoff multiplier
+    max_delay: float = 60.0         # cap at 60 seconds
+    retry_on: List[ErrorCategory] = field(default_factory=lambda: [
+        ErrorCategory.TRANSIENT,
+        ErrorCategory.RATE_LIMIT
+    ])
+
+
+class ErrorHandler:
+    """
+    Intelligent error handler with retry and fallback strategies.
+
+    Follows SOLID principles:
+    - Single Responsibility: Handles error recovery only
+    - Open/Closed: Extensible via RetryConfig
+    - Liskov Substitution: Can replace ToolExecutor in any context
+    - Interface Segregation: Separate methods for retry vs fallback
+    - Dependency Inversion: Depends on ToolExecutor abstraction
+
+    Uses composition pattern to wrap ToolExecutor without modifying it.
+    """
+
+    def __init__(self, executor: ToolExecutor, config: RetryConfig):
+        """
+        Initialize ErrorHandler with executor and retry configuration.
+
+        Args:
+            executor: ToolExecutor instance to wrap
+            config: RetryConfig with retry behavior settings
+        """
+        self.executor = executor
+        self.config = config
+
+    async def execute_with_retry(
+        self,
+        tool_name: str,
+        params: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        Execute tool with automatic retry on transient failures.
+
+        Uses exponential backoff: delay = initial_delay * (backoff_factor ^ retry_count)
+        Caps delay at max_delay to prevent excessive waits.
+
+        Args:
+            tool_name: Name of tool to execute
+            params: Parameters dict for the tool
+
+        Returns:
+            Dict with: success, tool_name, data/error, retry_count, execution_time_ms
+        """
+        retry_count = 0
+        last_error = None
+
+        for attempt in range(self.config.max_retries + 1):
+            # Execute tool
+            result = await self.executor.execute(tool_name, params)
+
+            # Success - return immediately
+            if result["success"]:
+                result["retry_count"] = retry_count
+                return result
+
+            # Failure - check if we should retry
+            last_error = result.get("error", "Unknown error")
+
+            # Don't retry if we've exhausted attempts
+            if attempt >= self.config.max_retries:
+                break
+
+            # Categorize the error to decide if we should retry
+            try:
+                # Recreate exception from error string for classification
+                error_msg = last_error
+
+                # Try to determine exception type from error message
+                if "timeout" in error_msg.lower() or "timed out" in error_msg.lower():
+                    exception = asyncio.TimeoutError(error_msg)
+                elif "missing required parameter" in error_msg.lower() or "invalid" in error_msg.lower():
+                    exception = ValueError(error_msg)
+                elif "429" in error_msg or "rate limit" in error_msg.lower():
+                    exception = RuntimeError(error_msg)
+                elif any(code in error_msg for code in ["503", "504", "502"]):
+                    exception = RuntimeError(error_msg)
+                else:
+                    exception = Exception(error_msg)
+
+                error_category = ErrorClassifier.categorize(exception)
+            except Exception:
+                # If classification fails, default to UNKNOWN (no retry)
+                error_category = ErrorCategory.UNKNOWN
+
+            # Check if this error type should be retried
+            if error_category not in self.config.retry_on:
+                # Don't retry permanent or unknown errors
+                result["retry_count"] = retry_count
+                return result
+
+            # Calculate exponential backoff delay
+            delay = min(
+                self.config.initial_delay * (self.config.backoff_factor ** retry_count),
+                self.config.max_delay
+            )
+
+            # Wait before retry
+            await asyncio.sleep(delay)
+            retry_count += 1
+
+        # All retries exhausted - return last error
+        result["retry_count"] = retry_count
+        return result
+
+    async def execute_with_fallback(
+        self,
+        primary_tool: str,
+        fallback_tools: List[str],
+        params: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        Execute tool with fallback to alternative tools on failure.
+
+        Tries primary tool first. If it fails, tries each fallback tool in order
+        until one succeeds or all fail.
+
+        Args:
+            primary_tool: Primary tool name to try first
+            fallback_tools: List of fallback tool names to try on failure
+            params: Parameters dict for all tools
+
+        Returns:
+            Dict with: success, tool_name, data/error, used_fallback, fallback_tool
+        """
+        # Try primary tool first
+        result = await self.executor.execute(primary_tool, params)
+
+        if result["success"]:
+            result["used_fallback"] = False
+            return result
+
+        # Primary failed - try fallbacks
+        for fallback_tool in fallback_tools:
+            result = await self.executor.execute(fallback_tool, params)
+
+            if result["success"]:
+                result["used_fallback"] = True
+                result["fallback_tool"] = fallback_tool
+                return result
+
+        # All fallbacks failed - return last error
+        result["used_fallback"] = False
+        return result
+
+
 def extract_citations_from_grounding(response: Any, max_results: int = 10) -> List[Dict[str, str]]:
     """
     Extract citations from Gemini response.
