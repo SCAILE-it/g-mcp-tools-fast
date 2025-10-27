@@ -1072,9 +1072,7 @@ class ErrorHandler:
 class StepParser:
     """
     Parse natural language plan steps into executable tool calls.
-
-    Single Responsibility: Convert human-readable steps to {tool_name, params} JSON.
-    Uses Gemini API for intelligent parsing with tool registry context.
+    Uses Gemini API to convert steps to {tool_name, params} JSON.
     """
 
     def __init__(self, tools: Dict[str, Any], api_key: Optional[str] = None):
@@ -1176,14 +1174,10 @@ If the step doesn't match any tool, return:
             }
         """
         try:
-            # Build tools context for Gemini WITH PARAMETER SCHEMAS (ROOT CAUSE FIX)
-            # Previous bug: Only sent tool names and tags, Gemini had no idea what params to extract
+            # Build tools context with parameter schemas extracted from TOOLS registry
             tools_context_parts = []
             for name, meta in self.tools.items():
-                # Get description
                 description = meta.get('tag', meta.get('doc', 'No description'))
-
-                # Get parameter schema from TOOLS registry
                 params_list = meta.get('params', [])
                 if params_list:
                     param_specs = []
@@ -1207,24 +1201,18 @@ If the step doesn't match any tool, return:
                 tools_context_parts.append(tool_info)
 
             tools_context = "\n".join(tools_context_parts)
-
-            # Call Gemini to parse step
             gemini_response = await self._call_gemini(step_description, tools_context)
 
-            # Parse JSON response
             import json
-            # Remove markdown code blocks if present
             gemini_response = gemini_response.replace("```json", "").replace("```", "").strip()
             parsed = json.loads(gemini_response)
 
-            # Check if Gemini returned an error
             if "error" in parsed:
                 return {
                     "success": False,
                     "error": parsed["error"]
                 }
 
-            # Validate tool exists
             tool_name = parsed.get("tool_name")
             if not tool_name or tool_name not in self.tools:
                 return {
@@ -1232,7 +1220,6 @@ If the step doesn't match any tool, return:
                     "error": f"Tool '{tool_name}' not found in registry"
                 }
 
-            # Return successful parse
             return {
                 "success": True,
                 "tool_name": tool_name,
@@ -1249,8 +1236,6 @@ If the step doesn't match any tool, return:
 class Orchestrator:
     """
     Orchestrate full AI workflow: Planner → StepParser → ToolExecutor → ErrorHandler → PlanTracker.
-
-    Composition Pattern: Wraps all Phase 3 components without inheritance.
     Coordinates execution with retry/fallback and progress tracking.
     """
 
@@ -1264,8 +1249,6 @@ class Orchestrator:
     ):
         """
         Initialize Orchestrator with all Phase 3 components.
-
-        Dependency Injection: Accepts optional components for testing (SOLID principle).
 
         Args:
             tools: TOOLS registry dict
@@ -1295,34 +1278,24 @@ class Orchestrator:
                 "plan_tracker": tracker_state
             }
         """
-        # Step 1: Generate plan (Planner.generate is sync, not async)
         plan_steps = self.planner.generate(user_request)
-
-        # Step 2: Initialize tracker
         tracker = PlanTracker(plan_steps)
-
-        # Step 3: Execute each step
         results = []
-        for i, step_desc in enumerate(plan_steps):
-            # Start step
-            tracker.start_step(i)
 
-            # Parse step to tool call
+        for i, step_desc in enumerate(plan_steps):
+            tracker.start_step(i)
             parsed = await self.step_parser.parse_step(step_desc)
 
             if not parsed["success"]:
-                # Failed to parse - mark as failed
                 tracker.fail_step(i, parsed["error"])
                 results.append(parsed)
                 continue
 
-            # Execute tool with retry/fallback
             result = await self.error_handler.execute_with_retry(
                 parsed["tool_name"],
                 parsed["params"]
             )
 
-            # Update tracker
             if result["success"]:
                 tracker.complete_step(i)
             else:
@@ -1330,7 +1303,6 @@ class Orchestrator:
 
             results.append(result)
 
-        # Return final result
         return {
             "success": True,
             "total_steps": len(plan_steps),
@@ -1354,13 +1326,9 @@ class Orchestrator:
         Yields:
             Dict[str, Any]: SSE event objects
         """
-        # Step 1: Generate plan (Planner.generate is sync, not async)
         plan_steps = self.planner.generate(user_request)
-
-        # Step 2: Initialize tracker
         tracker = PlanTracker(plan_steps)
 
-        # Yield plan_init event
         yield {
             "event": "plan_init",
             "data": {
@@ -1369,12 +1337,10 @@ class Orchestrator:
             }
         }
 
-        # Step 3: Execute each step and stream events
         successful = 0
         failed = 0
 
         for i, step_desc in enumerate(plan_steps):
-            # Yield step_start event
             yield {
                 "event": "step_start",
                 "data": {
@@ -1383,14 +1349,10 @@ class Orchestrator:
                 }
             }
 
-            # Start step
             tracker.start_step(i)
-
-            # Parse step to tool call
             parsed = await self.step_parser.parse_step(step_desc)
 
             if not parsed["success"]:
-                # Failed to parse
                 tracker.fail_step(i, parsed["error"])
                 failed += 1
 
@@ -1404,13 +1366,11 @@ class Orchestrator:
                 }
                 continue
 
-            # Execute tool with retry/fallback
             result = await self.error_handler.execute_with_retry(
                 parsed["tool_name"],
                 parsed["params"]
             )
 
-            # Update tracker and counters
             if result["success"]:
                 tracker.complete_step(i)
                 successful += 1
@@ -1418,7 +1378,6 @@ class Orchestrator:
                 tracker.fail_step(i, result.get("error", "Unknown error"))
                 failed += 1
 
-            # Yield step_complete event
             yield {
                 "event": "step_complete",
                 "data": {
