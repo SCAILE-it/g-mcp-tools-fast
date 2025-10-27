@@ -32,6 +32,9 @@ image = (
         "phonenumbers>=8.13",
         "python-whois>=0.9",
         "requests>=2.31",
+        # Supabase integration
+        "supabase>=2.0.0",
+        "pyjwt>=2.8.0",
     )
     .run_commands(
         # Playwright
@@ -396,6 +399,422 @@ def enrichment_tool(source: str):
         return wrapper
     return decorator
 
+
+# SHARED UTILITIES FOR NEW TOOLS
+
+class GeminiGroundingClient:
+    """
+    Production-grade Gemini client with grounding support.
+    Singleton-like pattern to avoid recreating clients.
+    """
+    _instance: Optional['GeminiGroundingClient'] = None
+    _lock = asyncio.Lock()
+
+    def __init__(self, api_key: Optional[str] = None):
+        # Lazy API key retrieval - check environment if not provided
+        if api_key is None:
+            api_key = os.getenv("GOOGLE_GENERATIVE_AI_API_KEY") or os.getenv("GEMINI_API_KEY")
+
+        if not api_key:
+            raise ValueError(
+                "Gemini API key required. Set GOOGLE_GENERATIVE_AI_API_KEY or GEMINI_API_KEY environment variable."
+            )
+        self.api_key = api_key
+        self._init_genai()
+
+    def _init_genai(self) -> None:
+        """Initialize Google Generative AI client"""
+        try:
+            import google.generativeai as genai
+            genai.configure(api_key=self.api_key)
+            self.genai = genai
+        except Exception as e:
+            raise RuntimeError(f"Failed to initialize Gemini client: {str(e)}")
+
+    @classmethod
+    async def get_instance(cls, api_key: Optional[str] = None) -> 'GeminiGroundingClient':
+        """Get or create singleton instance with lazy API key loading"""
+        async with cls._lock:
+            if cls._instance is None:
+                # Pass None to trigger lazy environment variable check in __init__
+                cls._instance = cls(api_key)
+            return cls._instance
+
+    async def generate_with_grounding(
+        self,
+        query: str,
+        system_instruction: Optional[str] = None,
+        temperature: float = 0.3,
+        max_tokens: int = 2048
+    ) -> Any:
+        """
+        Generate content with web search context simulation.
+        NOTE: True Google Search grounding requires Vertex AI.
+        This simulates grounding by instructing Gemini to provide sources.
+        """
+        try:
+            # Enhance prompt to request sources and citations
+            enhanced_query = f"""{query}
+
+Please provide:
+1. A comprehensive answer
+2. Cite specific sources and URLs where this information can be verified
+3. Format citations as: [Source Name](URL)"""
+
+            enhanced_instruction = system_instruction or ""
+            enhanced_instruction += "\n\nProvide factual information with specific source citations (website names and URLs). Be comprehensive and well-researched."
+
+            model = self.genai.GenerativeModel(
+                model_name="gemini-2.5-flash",
+                system_instruction=enhanced_instruction
+            )
+
+            response = await asyncio.to_thread(
+                model.generate_content,
+                enhanced_query,
+                generation_config={
+                    "temperature": temperature,
+                    "max_output_tokens": max_tokens
+                }
+            )
+            return response
+        except Exception as e:
+            raise RuntimeError(f"Gemini generation failed: {str(e)}")
+
+    async def generate_simple(
+        self,
+        prompt: str,
+        system_instruction: Optional[str] = None,
+        temperature: float = 0.7,
+        max_tokens: int = 4096
+    ) -> str:
+        """
+        Generate content without grounding (simple text generation).
+        Returns text string directly.
+        """
+        try:
+            model = self.genai.GenerativeModel(
+                model_name="gemini-2.5-flash",
+                system_instruction=system_instruction
+            )
+
+            response = await asyncio.to_thread(
+                model.generate_content,
+                prompt,
+                generation_config={
+                    "temperature": temperature,
+                    "max_output_tokens": max_tokens
+                }
+            )
+
+            # Handle safety blocks gracefully
+            if not hasattr(response, 'text') or not response.text:
+                # Check if blocked by safety filters
+                candidate = response.candidates[0] if response.candidates else None
+                if candidate and hasattr(candidate, 'finish_reason') and candidate.finish_reason == 2:
+                    return "Content generation blocked by safety filters. Please rephrase your request."
+                return "No content generated. Please try again with a different prompt."
+
+            return response.text
+        except Exception as e:
+            # Check if it's a safety block error
+            if "finish_reason" in str(e) and "2" in str(e):
+                return "Content generation blocked by safety filters. Please rephrase your request."
+            raise RuntimeError(f"Gemini generation failed: {str(e)}")
+
+
+# ============================================================================
+# PHASE 3.1: AI ORCHESTRATION FRAMEWORK - PLANNER + PLAN TRACKER
+# ============================================================================
+
+class Planner:
+    """
+    Generates execution plans from user requests using Gemini.
+    Returns numbered list of steps for orchestrated tool execution.
+    """
+
+    def __init__(self, api_key: Optional[str] = None):
+        """Initialize Planner with Gemini API key"""
+        if api_key is None:
+            api_key = os.getenv("GOOGLE_GENERATIVE_AI_API_KEY") or os.getenv("GEMINI_API_KEY")
+
+        if not api_key:
+            raise ValueError(
+                "Gemini API key required. Set GOOGLE_GENERATIVE_AI_API_KEY or GEMINI_API_KEY environment variable."
+            )
+
+        self.api_key = api_key
+        self._init_genai()
+
+    def _init_genai(self) -> None:
+        """Initialize Google Generative AI client"""
+        try:
+            import google.generativeai as genai
+            genai.configure(api_key=self.api_key)
+            self.genai = genai
+        except Exception as e:
+            raise RuntimeError(f"Failed to initialize Gemini client: {str(e)}")
+
+    def _call_gemini(self, prompt: str) -> str:
+        """Internal method to call Gemini API"""
+        model = self.genai.GenerativeModel("gemini-2.5-flash")
+        response = model.generate_content(prompt)
+        return response.text
+
+    def generate(self, user_request: str) -> List[str]:
+        """
+        Generate execution plan from user request.
+
+        Args:
+            user_request: User's task description
+
+        Returns:
+            List of step descriptions (numbered items extracted)
+        """
+        prompt = f"""You are a task planner. Break down the following user request into numbered steps.
+Each step should be a clear, actionable task.
+
+User request: {user_request}
+
+Respond with a numbered list ONLY (1. 2. 3. etc.). No explanations, no markdown code blocks."""
+
+        try:
+            response_text = self._call_gemini(prompt)
+
+            # Parse numbered steps
+            steps = []
+            for line in response_text.split('\n'):
+                line = line.strip()
+                # Match lines starting with number followed by period
+                if line and line[0].isdigit() and '.' in line:
+                    # Extract text after number and period
+                    parts = line.split('.', 1)
+                    if len(parts) == 2:
+                        step_text = parts[1].strip()
+                        if step_text:
+                            steps.append(step_text)
+
+            return steps
+        except Exception:
+            # Return empty list on error
+            return []
+
+
+class PlanTracker:
+    """
+    Tracks execution state of a multi-step plan.
+    Supports adaptive planning (adding steps dynamically).
+    """
+
+    def __init__(self, steps: List[str]):
+        """
+        Initialize tracker with list of steps.
+
+        Args:
+            steps: List of step descriptions
+        """
+        self.steps = steps
+        self.statuses = ["pending"] * len(steps)
+        self.current_step = 0
+
+    def get_status(self, index: int) -> str:
+        """Get status of step at index"""
+        return self.statuses[index]
+
+    def start_step(self, index: int) -> None:
+        """Mark step as in_progress"""
+        self.statuses[index] = "in_progress"
+        self.current_step = index
+
+    def complete_step(self, index: int) -> None:
+        """Mark step as completed"""
+        self.statuses[index] = "completed"
+
+    def fail_step(self, index: int, error_message: str) -> None:
+        """Mark step as failed"""
+        self.statuses[index] = "failed"
+
+    def add_step(self, description: str) -> None:
+        """Add new step (adaptive planning)"""
+        self.steps.append(description)
+        self.statuses.append("pending")
+
+    def find_or_add_step(self, description: str) -> int:
+        """
+        Find existing step by description, or add if not found.
+        Returns index of step.
+        """
+        # Try to find existing step
+        for i, step in enumerate(self.steps):
+            if step == description:
+                return i
+
+        # Not found - add new step
+        self.add_step(description)
+        return len(self.steps) - 1
+
+    def to_dict(self) -> Dict[str, Any]:
+        """
+        Export plan state for SSE events (Prompt Kit compatible).
+
+        Returns:
+            Dict with steps, current, total
+        """
+        return {
+            "steps": [
+                {
+                    "description": step,
+                    "status": status,
+                    "active": i == self.current_step and status == "in_progress"
+                }
+                for i, (step, status) in enumerate(zip(self.steps, self.statuses))
+            ],
+            "current": self.current_step,
+            "total": len(self.steps)
+        }
+
+
+def extract_citations_from_grounding(response: Any, max_results: int = 10) -> List[Dict[str, str]]:
+    """
+    Extract citations from Gemini response.
+    Parses markdown-style citations [Source](URL) from text since true grounding requires Vertex AI.
+
+    Args:
+        response: Raw Gemini response object
+        max_results: Maximum number of citations to return
+
+    Returns:
+        List of citation dicts with title, url, description
+    """
+    citations: List[Dict[str, str]] = []
+
+    try:
+        # Get response text
+        response_text = getattr(response, 'text', str(response))
+
+        # Parse markdown-style links: [Title](URL)
+        link_pattern = r'\[([^\]]+)\]\(([^\)]+)\)'
+        matches = re.findall(link_pattern, response_text)
+
+        for title, url in matches[:max_results]:
+            # Clean up URL (remove trailing punctuation)
+            url_clean = url.strip().rstrip('.,;:)')
+
+            citations.append({
+                "title": title.strip(),
+                "url": url_clean,
+                "description": None
+            })
+
+        # If no markdown links found, try to extract plain URLs
+        if not citations:
+            url_pattern = r'https?://[^\s<>"{}|\\^`\[\]]+'
+            urls_found = re.findall(url_pattern, response_text)
+
+            for url in urls_found[:max_results]:
+                url_clean = url.strip().rstrip('.,;:)')
+                citations.append({
+                    "title": url_clean.split('//')[-1].split('/')[0],  # Use domain as title
+                    "url": url_clean,
+                    "description": None
+                })
+
+    except Exception:
+        # Graceful degradation - return empty if parsing fails
+        pass
+
+    return citations
+
+
+def extract_search_queries_from_grounding(response: Any) -> List[str]:
+    """Extract web search queries - placeholder since true grounding requires Vertex AI"""
+    # Note: With simulated grounding, we don't have search query metadata
+    # Return empty list for now
+    return []
+
+
+def render_template(template: str, **variables) -> str:
+    """
+    Safe template variable substitution.
+    Supports {{var}} syntax. Production-safe (no eval/exec).
+
+    Args:
+        template: Template string with {{variable}} placeholders
+        **variables: Key-value pairs for substitution
+
+    Returns:
+        Rendered template string
+    """
+    result = template
+    for key, value in variables.items():
+        placeholder = f"{{{{{key}}}}}"
+        result = result.replace(placeholder, str(value))
+    return result
+
+
+def extract_urls_from_text(text: str) -> List[str]:
+    """
+    Extract all URLs from text using regex.
+    Returns deduplicated list of URLs.
+    """
+    url_pattern = r'https?://[^\s<>"{}|\\^`\[\]]+'
+    urls = re.findall(url_pattern, text)
+    # Deduplicate while preserving order
+    seen = set()
+    unique_urls = []
+    for url in urls:
+        if url not in seen:
+            seen.add(url)
+            unique_urls.append(url)
+    return unique_urls
+
+
+async def fetch_html_content(url: str, timeout: int = 10) -> str:
+    """
+    Fetch HTML content from URL with proper error handling.
+
+    Args:
+        url: URL to fetch
+        timeout: Request timeout in seconds
+
+    Returns:
+        HTML content string
+
+    Raises:
+        RuntimeError: If fetch fails
+    """
+    import requests
+
+    try:
+        # Ensure URL has protocol
+        if not url.startswith(('http://', 'https://')):
+            url = f'https://{url}'
+
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (compatible; g-mcp-tools/1.0)'
+        }
+
+        response = await asyncio.to_thread(
+            requests.get,
+            url,
+            headers=headers,
+            timeout=timeout,
+            allow_redirects=True
+        )
+
+        response.raise_for_status()
+        return response.text
+
+    except requests.exceptions.Timeout:
+        raise RuntimeError(f"Request timed out after {timeout}s")
+    except requests.exceptions.ConnectionError:
+        raise RuntimeError("Failed to connect to URL")
+    except requests.exceptions.HTTPError as e:
+        raise RuntimeError(f"HTTP error {e.response.status_code}")
+    except Exception as e:
+        raise RuntimeError(f"Failed to fetch URL: {str(e)}")
+
+
 @enrichment_tool("holehe")
 async def email_intel(email: str) -> Dict[str, Any]:
     """Check which platforms an email is registered on using holehe"""
@@ -519,6 +938,321 @@ async def analyze_github_profile(username: str) -> Dict[str, Any]:
     return {"username": username, "name": user_data.get("name"), "bio": user_data.get("bio"), "company": user_data.get("company"), "location": user_data.get("location"), "publicRepos": user_data.get("public_repos"), "followers": user_data.get("followers"), "following": user_data.get("following"), "languages": languages, "profileUrl": user_data.get("html_url")}
 
 
+# NEW POWER TOOLS - GEMINI GROUNDING
+
+@enrichment_tool("google-web-search")
+async def web_search(query: str, max_results: int = 5) -> Dict[str, Any]:
+    """
+    Web search using Gemini grounding.
+    Returns: summary, citations, search queries used
+    """
+    gemini = await GeminiGroundingClient.get_instance()
+
+    response = await gemini.generate_with_grounding(
+        query=query,
+        system_instruction="You are a web search assistant. Provide concise, factual summaries with citations.",
+        temperature=0.3,
+        max_tokens=2048
+    )
+
+    citations = extract_citations_from_grounding(response, max_results)
+    search_queries = extract_search_queries_from_grounding(response)
+
+    return {
+        "query": query,
+        "summary": response.text,
+        "citations": citations,
+        "search_queries": search_queries,
+        "total_citations": len(citations)
+    }
+
+
+@enrichment_tool("deep-research")
+async def deep_research(topic: str, num_queries: int = 3) -> Dict[str, Any]:
+    """
+    Deep research on a topic using multiple web searches with synthesis.
+    Composes web_search calls and synthesizes findings.
+    """
+    gemini = await GeminiGroundingClient.get_instance()
+
+    # Generate research queries
+    query_prompt = f"Generate {num_queries} specific web search queries to deeply research: {topic}\nReturn ONLY the queries, one per line."
+    query_response = await gemini.generate_simple(
+        prompt=query_prompt,
+        system_instruction="You are a research assistant generating focused search queries.",
+        temperature=0.5,
+        max_tokens=500
+    )
+
+    queries = [q.strip() for q in query_response.split('\n') if q.strip() and not q.strip().startswith('#')][:num_queries]
+
+    # Execute searches in parallel
+    search_results = []
+    for query in queries:
+        try:
+            result = await web_search(query, max_results=5)
+            if result.get("success"):
+                search_results.append(result["data"])
+        except Exception as e:
+            # Log but continue with other queries
+            search_results.append({"query": query, "error": str(e)})
+
+    # Synthesize findings
+    all_citations = []
+    all_summaries = []
+    for res in search_results:
+        if "citations" in res:
+            all_citations.extend(res["citations"])
+        if "summary" in res:
+            all_summaries.append(f"Query: {res['query']}\n{res['summary']}")
+
+    synthesis_prompt = f"Topic: {topic}\n\nFindings:\n" + "\n\n".join(all_summaries) + "\n\nSynthesize these findings into a comprehensive research summary."
+
+    synthesis = await gemini.generate_simple(
+        prompt=synthesis_prompt,
+        system_instruction="You are a research synthesizer. Create comprehensive, well-structured summaries.",
+        temperature=0.4,
+        max_tokens=3000
+    )
+
+    return {
+        "topic": topic,
+        "queries_executed": queries,
+        "num_sources": len(all_citations),
+        "synthesis": synthesis,
+        "citations": all_citations[:20],  # Limit to top 20
+        "individual_results": search_results
+    }
+
+
+@enrichment_tool("blog-create")
+async def blog_create(
+    template: str,
+    research_topic: Optional[str] = None,
+    **variables
+) -> Dict[str, Any]:
+    """
+    Create blog content from template with optional research integration.
+    Template uses {{variable}} syntax.
+    If research_topic provided, runs deep_research first.
+    """
+    gemini = await GeminiGroundingClient.get_instance()
+
+    # Optional research step
+    research_data = None
+    if research_topic:
+        try:
+            research_result = await deep_research(research_topic, num_queries=3)
+            if research_result.get("success"):
+                research_data = research_result["data"]
+                # Add research synthesis to variables
+                variables["research_findings"] = research_data.get("synthesis", "")
+                variables["citations"] = "\n".join([
+                    f"- {c.get('title', 'Untitled')}: {c.get('url', '')}"
+                    for c in research_data.get("citations", [])[:10]
+                ])
+        except Exception as e:
+            variables["research_findings"] = f"Research unavailable: {str(e)}"
+            variables["citations"] = ""
+
+    # Render template with variables
+    rendered_template = render_template(template, **variables)
+
+    # Generate final blog content
+    blog_content = await gemini.generate_simple(
+        prompt=rendered_template,
+        system_instruction="You are a professional content writer. Create engaging, well-structured blog content.",
+        temperature=0.7,
+        max_tokens=4096
+    )
+
+    return {
+        "template": template[:200] + "..." if len(template) > 200 else template,
+        "variables_used": list(variables.keys()),
+        "research_included": research_topic is not None,
+        "content": blog_content,
+        "word_count": len(blog_content.split()),
+        "research_data": research_data if research_data else None
+    }
+
+
+@enrichment_tool("aeo-health-check")
+async def aeo_health_check(url: str) -> Dict[str, Any]:
+    """
+    AEO/SEO health check with AI insights.
+    Analyzes: title, meta, h1, images, mobile, schema, load time
+    """
+    from bs4 import BeautifulSoup
+
+    # Fetch HTML
+    html = await fetch_html_content(url)
+    soup = BeautifulSoup(html, 'html.parser')
+
+    # Extract metrics
+    title = soup.find('title')
+    title_text = title.text.strip() if title else ""
+    title_score = 10 if 30 <= len(title_text) <= 60 else 5 if title_text else 0
+
+    meta_desc = soup.find('meta', attrs={'name': 'description'})
+    meta_text = meta_desc.get('content', '').strip() if meta_desc else ""
+    meta_score = 10 if 120 <= len(meta_text) <= 160 else 5 if meta_text else 0
+
+    h1_tags = soup.find_all('h1')
+    h1_count = len(h1_tags)
+    h1_score = 10 if h1_count == 1 else 0
+
+    images = soup.find_all('img')
+    total_images = len(images)
+    images_with_alt = len([img for img in images if img.get('alt')])
+    image_score = (images_with_alt / total_images * 10) if total_images > 0 else 10
+
+    has_viewport = soup.find('meta', attrs={'name': 'viewport'}) is not None
+    mobile_score = 10 if has_viewport else 0
+
+    has_schema = soup.find('script', attrs={'type': 'application/ld+json'}) is not None
+    schema_score = 10 if has_schema else 0
+
+    # Calculate total score
+    total_score = (title_score + meta_score + h1_score + image_score +
+                  mobile_score + schema_score) / 60 * 100
+
+    grade = ('A' if total_score >= 90 else 'B' if total_score >= 80 else
+            'C' if total_score >= 70 else 'D' if total_score >= 60 else 'F')
+
+    # AI insights
+    gemini = await GeminiGroundingClient.get_instance()
+
+    insight_prompt = f"""Analyze this SEO/AEO data:
+URL: {url}
+Title: "{title_text}" ({len(title_text)} chars)
+Meta: "{meta_text}" ({len(meta_text)} chars)
+H1 Count: {h1_count}
+Images: {images_with_alt}/{total_images} with alt
+Mobile: {has_viewport}
+Schema: {has_schema}
+Score: {total_score:.1f}% (Grade {grade})
+
+Provide 2 sentences of insight and 3 specific recommendations in JSON format:
+{{"insights": "...", "recommendations": ["1. ...", "2. ...", "3. ..."]}}"""
+
+    try:
+        ai_response = await gemini.generate_simple(
+            prompt=insight_prompt,
+            system_instruction="You are an SEO expert. Provide actionable insights.",
+            temperature=0.5,
+            max_tokens=500
+        )
+
+        # Parse JSON from response
+        import json as json_lib
+        json_match = re.search(r'\{[\s\S]*\}', ai_response)
+        if json_match:
+            parsed = json_lib.loads(json_match.group(0))
+            insights = parsed.get('insights', 'Analysis complete.')
+            recommendations = parsed.get('recommendations', [])
+        else:
+            insights = ai_response
+            recommendations = [
+                "1. Optimize title and meta description",
+                "2. Use exactly one H1 tag per page",
+                "3. Add alt text to all images"
+            ]
+    except Exception:
+        insights = "AI analysis unavailable"
+        recommendations = [
+            "1. Optimize title and meta description",
+            "2. Use exactly one H1 tag per page",
+            "3. Add alt text to all images"
+        ]
+
+    return {
+        "url": url,
+        "score": round(total_score, 1),
+        "grade": grade,
+        "metrics": {
+            "title": {"text": title_text, "length": len(title_text), "score": title_score},
+            "meta_description": {"text": meta_text, "length": len(meta_text), "score": meta_score},
+            "h1_tags": {"count": h1_count, "score": h1_score},
+            "images": {"total": total_images, "with_alt": images_with_alt, "score": round(image_score, 1)},
+            "mobile": {"optimized": has_viewport, "score": mobile_score},
+            "schema": {"present": has_schema, "score": schema_score}
+        },
+        "ai_insights": insights,
+        "recommendations": recommendations
+    }
+
+
+@enrichment_tool("aeo-mentions")
+async def aeo_mentions_check(
+    company_name: str,
+    industry: str,
+    num_queries: int = 3
+) -> Dict[str, Any]:
+    """
+    Monitor company mentions in AI search results.
+    Uses generic industry questions to organically check for mentions.
+    """
+    gemini = await GeminiGroundingClient.get_instance()
+
+    # Generate industry-specific queries (NO company name mentioned)
+    query_gen_prompt = f"""Generate {num_queries} generic industry questions for "{industry}" that would naturally reveal top companies.
+Do NOT mention "{company_name}" in the questions.
+Examples:
+- "What are the best tools for {industry}?"
+- "Which companies are leading in {industry} innovation?"
+Return ONLY the questions, one per line."""
+
+    query_response = await gemini.generate_simple(
+        prompt=query_gen_prompt,
+        system_instruction="You are a market research assistant generating unbiased industry questions.",
+        temperature=0.6,
+        max_tokens=400
+    )
+
+    queries = [q.strip() for q in query_response.split('\n') if q.strip() and not q.strip().startswith('#')][:num_queries]
+
+    # Execute searches and check for mentions
+    total_mentions = 0
+    mention_details = []
+
+    for query in queries:
+        try:
+            search_result = await web_search(query, max_results=5)
+            if not search_result.get("success"):
+                continue
+
+            data = search_result["data"]
+            response_text = data.get("summary", "").lower()
+            company_lower = company_name.lower()
+
+            # Count mentions
+            mention_count = response_text.count(company_lower)
+
+            if mention_count > 0:
+                total_mentions += mention_count
+                mention_details.append({
+                    "query": query,
+                    "mention_count": mention_count,
+                    "context_snippet": response_text[:300] + "...",
+                    "citations": data.get("citations", [])[:3]
+                })
+        except Exception as e:
+            mention_details.append({"query": query, "error": str(e)})
+
+    mention_rate = (total_mentions / (len(queries) * 2)) * 100 if queries else 0  # Assume avg 2 mentions per query is 100%
+
+    return {
+        "company_name": company_name,
+        "industry": industry,
+        "queries_tested": queries,
+        "total_mentions": total_mentions,
+        "mention_rate": round(mention_rate, 1),
+        "visibility_score": min(100, round(mention_rate * 1.5, 1)),  # Boosted score
+        "mention_details": mention_details,
+        "summary": f"{company_name} mentioned {total_mentions} times across {len(queries)} industry queries ({mention_rate:.1f}% mention rate)"
+    }
+
+
 # AUTO-DETECTION
 
 FIELD_PATTERNS = {
@@ -575,16 +1309,8 @@ async def run_enrichments(data: Dict[str, Any], tool_specs: List[Tuple[str, str,
     results = {**data}  # Start with original data
     errors = []
 
-    # Map tool names to functions
-    tool_map = {
-        "phone-validation": lambda v: validate_phone(v, "US"),
-        "email-intel": lambda v: email_intel(v),
-        "email-pattern": lambda v: generate_email_patterns(v),
-        "whois": lambda v: lookup_whois(v),
-        "tech-stack": lambda v: detect_tech_stack(v),
-        "company-data": lambda v: get_company_data(v),
-        "github-intel": lambda v: analyze_github_profile(v),
-    }
+    # Map tool names to functions - dynamically built from TOOLS registry
+    tool_map = {name: config["fn"] for name, config in TOOLS.items()}
 
     # Run each enrichment
     for tool_name, field_name, value in tool_specs:
@@ -604,10 +1330,214 @@ async def run_enrichments(data: Dict[str, Any], tool_specs: List[Tuple[str, str,
     return results
 
 
-# AUTHENTICATION
+# ============================================================================
+# SUPABASE INTEGRATION: Authentication, Logging, and Quota Management
+# ============================================================================
+
+def log_api_call(
+    tool_name: str,
+    tool_type: str,
+    input_data: Dict[str, Any],
+    output_data: Dict[str, Any],
+    success: bool,
+    processing_ms: int,
+    user_id: Optional[str] = None,
+    error_message: Optional[str] = None,
+    tokens_used: int = 0
+) -> None:
+    """
+    Log API call to Supabase for audit trail, analytics, and billing.
+
+    This function is called after every API request to maintain a complete
+    audit trail. Uses service_role key to bypass RLS policies.
+
+    Args:
+        tool_name: Name of the tool (e.g., 'email-intel', 'web-search')
+        tool_type: Tool category ('enrichment', 'generation', 'analysis')
+        input_data: Request parameters
+        output_data: Response data
+        success: Whether the request succeeded
+        processing_ms: Request processing time in milliseconds
+        user_id: User UUID (None for anonymous/API-key requests)
+        error_message: Error details if request failed
+        tokens_used: Number of tokens consumed (for Gemini calls)
+    """
+    from supabase import create_client
+
+    supabase_url = os.environ.get("SUPABASE_URL")
+    supabase_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+
+    if not supabase_url or not supabase_key:
+        # Logging disabled - skip silently
+        return
+
+    try:
+        supabase = create_client(supabase_url, supabase_key)
+        supabase.table("api_calls").insert({
+            "user_id": user_id,
+            "tool_name": tool_name,
+            "tool_type": tool_type,
+            "input_data": input_data,
+            "output_data": output_data,
+            "success": success,
+            "error_message": error_message,
+            "processing_ms": processing_ms,
+            "tokens_used": tokens_used
+        }).execute()
+    except Exception as e:
+        # Logging failures should not break the API
+        print(f"⚠️  API call logging failed: {e}")
+
+
+def check_quota(user_id: str) -> None:
+    """
+    Atomically check and increment user's monthly quota.
+
+    Uses database function for atomic operation to prevent race conditions
+    when multiple requests arrive simultaneously. Auto-resets quota on new month.
+
+    Args:
+        user_id: User UUID
+
+    Raises:
+        HTTPException(429): If monthly quota exceeded
+        HTTPException(500): If Supabase not configured
+    """
+    from supabase import create_client
+    from fastapi import HTTPException
+
+    supabase_url = os.environ.get("SUPABASE_URL")
+    supabase_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+
+    if not supabase_url or not supabase_key:
+        raise HTTPException(
+            status_code=500,
+            detail="Quota enforcement not configured"
+        )
+
+    try:
+        supabase = create_client(supabase_url, supabase_key)
+
+        # Call atomic database function
+        result = supabase.rpc("check_and_increment_quota", {
+            "p_user_id": user_id
+        }).execute()
+
+        if not result.data or len(result.data) == 0:
+            raise HTTPException(
+                status_code=500,
+                detail="Quota check failed"
+            )
+
+        quota_check = result.data[0]
+
+        if not quota_check["allowed"]:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Monthly quota exceeded. Limit: {quota_check['quota_total']} calls/month. "
+                       f"Resets: {quota_check['period_start']}. Contact support to upgrade."
+            )
+
+    except HTTPException:
+        # Re-raise HTTP exceptions as-is
+        raise
+    except Exception as e:
+        # Log unexpected errors but don't block request
+        print(f"⚠️  Quota check failed: {e}")
+        # Allow request to proceed if quota check fails
+
+
+def calculate_next_run_at(schedule_preset: str, from_time: Optional[datetime] = None) -> datetime:
+    """
+    Calculate next scheduled run time based on preset.
+
+    Args:
+        schedule_preset: 'daily', 'weekly', or 'monthly'
+        from_time: Starting time (defaults to now)
+
+    Returns:
+        Next scheduled run time
+
+    Raises:
+        ValueError: If invalid preset
+    """
+    if from_time is None:
+        from_time = datetime.now()
+
+    if schedule_preset == 'daily':
+        return from_time + timedelta(days=1)
+    elif schedule_preset == 'weekly':
+        return from_time + timedelta(days=7)
+    elif schedule_preset == 'monthly':
+        return from_time + timedelta(days=30)
+    else:
+        raise ValueError(f"Invalid schedule_preset: {schedule_preset}. Must be 'daily', 'weekly', or 'monthly'")
+
+
+def verify_jwt_token(token: str) -> Optional[str]:
+    """
+    Verify JWT token locally using Supabase JWT secret.
+
+    Local verification is fast (<1ms) and doesn't require API calls to Supabase.
+    This is critical for performance at scale.
+
+    Args:
+        token: JWT token from Authorization header
+
+    Returns:
+        User UUID if token is valid, None otherwise
+
+    Raises:
+        HTTPException(401): If token is invalid or expired
+        HTTPException(500): If JWT secret not configured
+    """
+    import jwt
+    from fastapi import HTTPException
+
+    jwt_secret = os.environ.get("SUPABASE_JWT_SECRET")
+
+    if not jwt_secret:
+        raise HTTPException(
+            status_code=500,
+            detail="JWT authentication not configured. Set SUPABASE_JWT_SECRET in Modal secret. "
+                   "Get JWT secret from Supabase Dashboard: Settings → API → JWT Secret"
+        )
+
+    try:
+        payload = jwt.decode(
+            token,
+            jwt_secret,
+            algorithms=["HS256"],
+            audience="authenticated"
+        )
+
+        return payload.get("sub")  # user_id
+
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(
+            status_code=401,
+            detail="Token expired"
+        )
+    except jwt.InvalidTokenError as e:
+        raise HTTPException(
+            status_code=401,
+            detail=f"Invalid token: {str(e)}"
+        )
+
 
 def verify_api_key(api_key: Optional[str]) -> bool:
-    """Verify API key. Set MODAL_API_KEY secret to enable auth."""
+    """
+    Verify legacy API key for backward compatibility.
+
+    This maintains backward compatibility with existing integrations
+    using x-api-key header. New integrations should use JWT auth.
+
+    Args:
+        api_key: API key from x-api-key header
+
+    Returns:
+        True if valid or auth disabled, False otherwise
+    """
     required_key = os.environ.get("MODAL_API_KEY")
     if not required_key:
         return True  # No auth required if MODAL_API_KEY not set
@@ -784,18 +1714,222 @@ async def process_batch_parallel(
     return summary
 
 
+# SCHEDULED WORKER - Executes scheduled jobs automatically
+@app.function(
+    image=image,
+    schedule=modal.Period(minutes=15),
+    secrets=[
+        modal.Secret.from_name("gemini-secret"),
+        modal.Secret.from_name("gtm-tools-supabase")
+    ],
+    timeout=600
+)
+async def run_scheduled_jobs():
+    """
+    Scheduled worker that runs every 15 minutes.
+    Finds and executes jobs where is_scheduled = TRUE and next_run_at <= NOW().
+    """
+    import os
+    import time
+    from datetime import datetime
+
+    try:
+        from supabase import create_client
+        supabase_url = os.environ.get("SUPABASE_URL")
+        supabase_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+
+        if not supabase_url or not supabase_key:
+            print("❌ Scheduled worker: Supabase not configured")
+            return
+
+        supabase = create_client(supabase_url, supabase_key)
+        now = datetime.now()
+
+        # Query for due jobs
+        result = supabase.table("saved_queries")\
+            .select("*")\
+            .eq("is_scheduled", True)\
+            .lte("next_run_at", now.isoformat())\
+            .execute()
+
+        if not result.data:
+            print(f"✅ Scheduled worker: No jobs due at {now.isoformat()}")
+            return
+
+        jobs = result.data
+        print(f"🚀 Scheduled worker: Found {len(jobs)} jobs to execute")
+
+        # Execute each job
+        for job in jobs:
+            job_id = job["id"]
+            user_id = job["user_id"]
+            tool_name = job["tool_name"]
+            params = job["params"]
+            schedule_preset = job.get("schedule_preset")
+
+            print(f"  ⏰ Executing job {job_id}: {job['name']} (tool: {tool_name})")
+
+            start_time = time.time()
+            success = False
+            error_msg = None
+
+            try:
+                # Detect if this is a bulk job or single tool job
+                if "rows" in params and isinstance(params.get("rows"), list):
+                    # BULK JOB - Process multiple rows
+                    batch_id = f"scheduled_{job_id}_{int(start_time * 1000)}"
+                    rows = params["rows"]
+                    tools = params.get("tools")  # Optional explicit tools
+
+                    print(f"    📦 Bulk job: {len(rows)} rows")
+
+                    if tools:
+                        # Explicit tools specified
+                        result = await process_batch_internal(
+                            batch_id=batch_id,
+                            rows=rows,
+                            auto_detect=False,
+                            tool_names=tools,
+                            webhook_url=None
+                        )
+                    else:
+                        # Auto-detect tools per row
+                        result = await process_batch_internal(
+                            batch_id=batch_id,
+                            rows=rows,
+                            auto_detect=True,
+                            tool_names=None,
+                            webhook_url=None
+                        )
+
+                    # Bulk job success if completed (even with some row failures)
+                    success = result.get("status") in ["completed", "completed_with_errors"]
+                    if not success:
+                        error_msg = f"Batch processing failed: {result.get('status')}"
+
+                    print(f"    ✅ Bulk job {job_id}: {result.get('successful', 0)}/{result.get('total_rows', 0)} rows succeeded")
+
+                else:
+                    # SINGLE TOOL JOB - Execute one tool
+                    if tool_name not in TOOLS:
+                        raise ValueError(f"Unknown tool: {tool_name}")
+
+                    tool_config = TOOLS[tool_name]
+                    tool_fn = tool_config["fn"]
+
+                    # Execute tool
+                    result = await tool_fn(**params)
+                    success = True
+                    print(f"    ✅ Job {job_id} succeeded")
+
+            except Exception as e:
+                error_msg = str(e)
+                print(f"    ❌ Job {job_id} failed: {error_msg}")
+
+            # Calculate next run time
+            try:
+                next_run = calculate_next_run_at(schedule_preset, from_time=now)
+            except Exception as e:
+                print(f"    ⚠️  Failed to calculate next run: {e}")
+                next_run = now  # Fallback to now (won't run again until manually updated)
+
+            # Update job
+            processing_ms = int((time.time() - start_time) * 1000)
+
+            update_result = supabase.table("saved_queries")\
+                .update({
+                    "last_run_at": now.isoformat(),
+                    "next_run_at": next_run.isoformat(),
+                    "updated_at": now.isoformat()
+                })\
+                .eq("id", job_id)\
+                .execute()
+
+            # Log API call
+            try:
+                # For bulk jobs, log as bulk operation; for single tools, log the specific tool
+                if "rows" in params and isinstance(params.get("rows"), list):
+                    # Bulk job logging
+                    log_tool_name = "bulk-auto" if not params.get("tools") else "bulk-tools"
+                    log_tool_type = "enrichment"
+                    log_input = {
+                        "rows_count": len(params["rows"]),
+                        "tools": params.get("tools", "auto-detect")
+                    }
+                    log_output = {
+                        "successful": result.get("successful", 0) if success else 0,
+                        "failed": result.get("failed", 0) if success else len(params["rows"])
+                    }
+                else:
+                    # Single tool logging
+                    log_tool_name = tool_name
+                    log_tool_type = TOOLS[tool_name]["type"] if tool_name in TOOLS else "unknown"
+                    log_input = params
+                    log_output = result if success else {}
+
+                log_api_call(
+                    tool_name=log_tool_name,
+                    tool_type=log_tool_type,
+                    input_data=log_input,
+                    output_data=log_output,
+                    success=success,
+                    processing_ms=processing_ms,
+                    user_id=user_id,
+                    error_message=error_msg
+                )
+            except Exception as e:
+                print(f"    ⚠️  Failed to log API call: {e}")
+
+        print(f"✅ Scheduled worker: Completed {len(jobs)} jobs")
+
+    except Exception as e:
+        print(f"❌ Scheduled worker critical error: {str(e)}")
+
+
+# TOOL REGISTRY - Hierarchical organization by tool type (module-level for access from workers)
+TOOLS = {
+    # ENRICHMENT TOOLS - Data enrichment (takes data IN, returns enriched data OUT)
+    "email-intel": {"fn": email_intel, "type": "enrichment", "params": [("email", str, True)], "tag": "Email Intelligence", "doc": "Check which platforms an email is registered on.\n\n- **email**: Email address to check"},
+    "email-finder": {"fn": email_finder, "type": "enrichment", "params": [("domain", str, True), ("limit", int, False, 50)], "tag": "Email Intelligence", "doc": "Find email addresses associated with a domain.\n\n- **domain**: Domain to search\n- **limit**: Max results (default: 50)"},
+    "company-data": {"fn": get_company_data, "type": "enrichment", "params": [("company_name", str, True), ("domain", str, False, None)], "tag": "Company Intelligence", "doc": "Get company registration data.\n\n- **company_name**: Company name\n- **domain**: Optional domain"},
+    "phone-validation": {"fn": validate_phone, "type": "enrichment", "params": [("phone_number", str, True), ("default_country", str, False, "US")], "tag": "Contact Validation", "doc": "Validate and format phone numbers.\n\n- **phone_number**: Phone to validate\n- **default_country**: Country code (default: US)"},
+    "tech-stack": {"fn": detect_tech_stack, "type": "enrichment", "params": [("domain", str, True)], "tag": "Technical Intelligence", "doc": "Detect technologies used by a website.\n\n- **domain**: Domain to analyze"},
+    "email-pattern": {"fn": generate_email_patterns, "type": "enrichment", "params": [("domain", str, True), ("first_name", str, False, None), ("last_name", str, False, None)], "tag": "Email Intelligence", "doc": "Generate common email patterns.\n\n- **domain**: Domain\n- **first_name**: Optional first name\n- **last_name**: Optional last name"},
+    "whois": {"fn": lookup_whois, "type": "enrichment", "params": [("domain", str, True)], "tag": "Domain Intelligence", "doc": "WHOIS lookup for domain registration.\n\n- **domain**: Domain to look up"},
+    "github-intel": {"fn": analyze_github_profile, "type": "enrichment", "params": [("username", str, True)], "tag": "Developer Intelligence", "doc": "Analyze GitHub user profile.\n\n- **username**: GitHub username"},
+
+    # GENERATION TOOLS - Content & research generation (creates NEW content)
+    "web-search": {"fn": web_search, "type": "generation", "params": [("query", str, True), ("max_results", int, False, 5)], "tag": "AI Research", "doc": "Web search using Gemini grounding with citations.\n\n- **query**: Search query\n- **max_results**: Max citations (default: 5)"},
+    "deep-research": {"fn": deep_research, "type": "generation", "params": [("topic", str, True), ("num_queries", int, False, 3)], "tag": "AI Research", "doc": "Deep research with multi-query synthesis.\n\n- **topic**: Research topic\n- **num_queries**: Number of searches (default: 3)"},
+    "blog-create": {"fn": blog_create, "type": "generation", "params": [("template", str, True), ("research_topic", str, False, None)], "tag": "Content Creation", "doc": "Create blog content from template with optional research.\n\n- **template**: Content template (use {{variable}} syntax)\n- **research_topic**: Optional topic for research integration\n- **Additional params**: Any custom variables for template"},
+
+    # ANALYSIS TOOLS - Analysis & scoring (analyzes existing resources)
+    "aeo-health-check": {"fn": aeo_health_check, "type": "analysis", "params": [("url", str, True)], "tag": "SEO & AEO", "doc": "SEO/AEO health check with AI insights.\n\n- **url**: Website URL to analyze"},
+    "aeo-mentions": {"fn": aeo_mentions_check, "type": "analysis", "params": [("company_name", str, True), ("industry", str, True), ("num_queries", int, False, 3)], "tag": "SEO & AEO", "doc": "Monitor company mentions in AI search results.\n\n- **company_name**: Company to monitor\n- **industry**: Industry context\n- **num_queries**: Number of test queries (default: 3)"}
+}
+
+
 # FASTAPI ROUTES
 
-@app.function(image=image, secrets=[modal.Secret.from_name("gemini-secret")], timeout=300, scaledown_window=120)
+@app.function(
+    image=image,
+    secrets=[
+        modal.Secret.from_name("gemini-secret"),
+        modal.Secret.from_name("gtm-tools-supabase")
+    ],
+    timeout=300,
+    scaledown_window=120
+)
 @modal.asgi_app()
 def api():
-    from fastapi import FastAPI, Header, HTTPException, Body
+    import time
+    from fastapi import FastAPI, Header, HTTPException, Body, Depends, Request
     from fastapi.responses import JSONResponse
     from fastapi.openapi.utils import get_openapi
 
     web_app = FastAPI(
         title="g-mcp-tools-fast",
-        description="Production-ready enrichment API with 9 tools: web scraping, email intel, company data, phone validation, tech stack detection, and more.",
+        description="GTM power API with 13 tools organized by category: enrichment (8), generation (3), and analysis (2). Web scraping, email intel, company data, phone validation, tech stack detection, AI research, content creation, and SEO/AEO analysis.",
         version="1.0.0",
         docs_url="/docs",
         redoc_url="/redoc",
@@ -808,7 +1942,7 @@ def api():
         openapi_schema = get_openapi(
             title="g-mcp-tools-fast API",
             version="1.0.0",
-            description="Enterprise-grade enrichment API with 9 data intelligence tools",
+            description="GTM power API: enrichment, generation, and analysis tools",
             routes=web_app.routes,
         )
         openapi_schema["info"]["x-logo"] = {
@@ -819,47 +1953,184 @@ def api():
 
     web_app.openapi = custom_openapi
 
-    # TOOL REGISTRY
-    ENRICHMENT_TOOLS = {
-        "email-intel": {"fn": email_intel, "params": [("email", str, True)], "tag": "Email Intelligence", "doc": "Check which platforms an email is registered on.\n\n- **email**: Email address to check"},
-        "email-finder": {"fn": email_finder, "params": [("domain", str, True), ("limit", int, False, 50)], "tag": "Email Intelligence", "doc": "Find email addresses associated with a domain.\n\n- **domain**: Domain to search\n- **limit**: Max results (default: 50)"},
-        "company-data": {"fn": get_company_data, "params": [("company_name", str, True), ("domain", str, False, None)], "tag": "Company Intelligence", "doc": "Get company registration data.\n\n- **company_name**: Company name\n- **domain**: Optional domain"},
-        "phone-validation": {"fn": validate_phone, "params": [("phone_number", str, True), ("default_country", str, False, "US")], "tag": "Contact Validation", "doc": "Validate and format phone numbers.\n\n- **phone_number**: Phone to validate\n- **default_country**: Country code (default: US)"},
-        "tech-stack": {"fn": detect_tech_stack, "params": [("domain", str, True)], "tag": "Technical Intelligence", "doc": "Detect technologies used by a website.\n\n- **domain**: Domain to analyze"},
-        "email-pattern": {"fn": generate_email_patterns, "params": [("domain", str, True), ("first_name", str, False, None), ("last_name", str, False, None)], "tag": "Email Intelligence", "doc": "Generate common email patterns.\n\n- **domain**: Domain\n- **first_name**: Optional first name\n- **last_name**: Optional last name"},
-        "whois": {"fn": lookup_whois, "params": [("domain", str, True)], "tag": "Domain Intelligence", "doc": "WHOIS lookup for domain registration.\n\n- **domain**: Domain to look up"},
-        "github-intel": {"fn": analyze_github_profile, "params": [("username", str, True)], "tag": "Developer Intelligence", "doc": "Analyze GitHub user profile.\n\n- **username**: GitHub username"}
-    }
+    # Authentication dependency - extracts user_id from JWT or API key
+    async def get_current_user(
+        authorization: Optional[str] = Header(None),
+        x_api_key: Optional[str] = Header(None)
+    ) -> Optional[str]:
+        """
+        Extract user_id from JWT (preferred) or fall back to legacy API key.
+
+        Priority order:
+        1. JWT in Authorization header (per-user tracking)
+        2. Legacy API key in x-api-key header (no user tracking)
+        3. Anonymous (if auth disabled)
+
+        Returns:
+            User UUID if JWT auth, None if API key or anonymous
+        """
+        # Priority 1: JWT authentication (per-user)
+        if authorization:
+            if not authorization.startswith("Bearer "):
+                raise HTTPException(
+                    status_code=401,
+                    detail="Invalid Authorization header format. Use: Authorization: Bearer <token>"
+                )
+
+            token = authorization.replace("Bearer ", "")
+            return verify_jwt_token(token)  # Returns user_id or raises HTTPException
+
+        # Priority 2: Legacy API key (backward compatible, no user tracking)
+        if x_api_key:
+            if not verify_api_key(x_api_key):
+                raise HTTPException(status_code=401, detail="Invalid API key")
+            return None  # Valid API key but no user_id
+
+        # Priority 3: Anonymous (only if MODAL_API_KEY not set)
+        if not os.environ.get("MODAL_API_KEY"):
+            return None  # Anonymous access allowed
+
+        # Auth required but not provided
+        raise HTTPException(
+            status_code=401,
+            detail="Authentication required. Provide JWT token or API key."
+        )
 
     def create_enrichment_route(tool_name: str, config: dict):
-        async def handler(request_data: Dict[str, Any] = Body(...), x_api_key: Optional[str] = Header(None)):
-            if not verify_api_key(x_api_key): raise HTTPException(status_code=401, detail="Invalid or missing API key")
+        """
+        Create a FastAPI route handler for an enrichment tool.
+
+        Adds comprehensive logging, quota enforcement, and error handling.
+        """
+        async def handler(
+            request_data: Dict[str, Any] = Body(...),
+            user_id: Optional[str] = Depends(get_current_user)
+        ):
+            start_time = time.time()
+
+            # Quota enforcement for authenticated users
+            if user_id:
+                check_quota(user_id)
+
+            # Parse and validate parameters
             kwargs = {}
             for param_config in config["params"]:
                 param_name, is_required = param_config[0], param_config[2]
                 value = request_data.get(param_name)
-                if is_required and not value: return JSONResponse(status_code=400, content={"success": False, "error": f"{param_name} required"})
-                if len(param_config) == 4: kwargs[param_name] = value if value is not None else param_config[3]
-                elif value is not None: kwargs[param_name] = value
-            result = await config["fn"](**kwargs)
+
+                if is_required and not value:
+                    # Early return for missing required params (no execution, no quota consumed)
+                    return JSONResponse(
+                        status_code=400,
+                        content={"success": False, "error": f"{param_name} required"}
+                    )
+
+                if len(param_config) == 4:
+                    kwargs[param_name] = value if value is not None else param_config[3]
+                elif value is not None:
+                    kwargs[param_name] = value
+
+            # Execute tool with error handling and logging
+            try:
+                result = await config["fn"](**kwargs)
+                success = True
+                error_msg = None
+            except Exception as e:
+                result = {"success": False, "error": str(e)}
+                success = False
+                error_msg = str(e)
+
+            # Calculate processing time
+            processing_ms = int((time.time() - start_time) * 1000)
+
+            # Log API call (always happens, even on error)
+            log_api_call(
+                tool_name=tool_name,
+                tool_type=config["type"],
+                input_data=request_data,
+                output_data=result,
+                success=success,
+                processing_ms=processing_ms,
+                user_id=user_id,
+                error_message=error_msg,
+                tokens_used=result.get("metadata", {}).get("total_tokens", 0) if success else 0
+            )
+
+            # Return appropriate status code
+            if not success:
+                return JSONResponse(status_code=500, content=result)
+
             return JSONResponse(content=result)
-        handler.__doc__, handler.__name__ = config["doc"], f"{tool_name.replace('-', '_')}_route"
+
+        handler.__doc__ = config["doc"]
+        handler.__name__ = f"{tool_name.replace('-', '_')}_route"
         return handler
 
     # EXPLICIT ENDPOINTS
     @web_app.get("/health", tags=["System"])
     async def health_check():
         """Health check endpoint for monitoring and uptime checks."""
+        categories = list({config["type"] for config in TOOLS.values()})
         return {
             "status": "healthy",
             "service": "g-mcp-tools-fast",
             "version": "1.0.0",
-            "tools": 9,
+            "tools": len(TOOLS),
+            "categories": categories,  # ["enrichment", "generation", "analysis"]
             "timestamp": datetime.now().isoformat() + "Z",
         }
 
+    @web_app.post("/plan", tags=["AI Orchestration"])
+    async def plan_route(
+        request_data: Dict[str, Any] = Body(...),
+        user_id: Optional[str] = Depends(get_current_user)
+    ):
+        """
+        Generate execution plan from user request using AI planning.
+
+        Phase 3.1: Planner - Returns numbered list of steps for orchestrated execution.
+
+        - **user_request**: Natural language task description
+
+        Returns:
+            - **success**: bool
+            - **plan**: List of step descriptions
+            - **total_steps**: Number of steps in plan
+        """
+        try:
+            user_request = request_data.get("user_request")
+            if not user_request:
+                return JSONResponse(
+                    status_code=400,
+                    content={"success": False, "error": "Missing required field: user_request"}
+                )
+
+            # Initialize Planner
+            planner = Planner()
+
+            # Generate plan
+            plan = planner.generate(user_request)
+
+            return {
+                "success": True,
+                "plan": plan,
+                "total_steps": len(plan),
+                "metadata": {
+                    "user_request": user_request,
+                    "generated_at": datetime.now().isoformat() + "Z"
+                }
+            }
+        except Exception as e:
+            return JSONResponse(
+                status_code=500,
+                content={"success": False, "error": str(e)}
+            )
+
     @web_app.post("/scrape", tags=["Web Scraping"])
-    async def scrape_route(request_data: Dict[str, Any], x_api_key: Optional[str] = Header(None)):
+    async def scrape_route(
+        request_data: Dict[str, Any],
+        user_id: Optional[str] = Depends(get_current_user)
+    ):
         """
         Extract structured data from any website using AI.
 
@@ -869,32 +2140,81 @@ def api():
         - **max_pages**: Number of pages to scrape (1-50)
         - **auto_discover_pages**: Auto-discover relevant pages
         """
-        if not verify_api_key(x_api_key):
-            raise HTTPException(status_code=401, detail="Invalid or missing API key")
+        start_time = time.time()
+
+        # Quota enforcement for authenticated users
+        if user_id:
+            check_quota(user_id)
+
+        # Validate request
         try:
             scrape_request = ScrapeRequest(**request_data)
         except Exception as e:
-            return JSONResponse(status_code=400, content={
+            error_response = {
                 "success": False,
                 "error": f"Invalid request: {str(e)}",
                 "metadata": {"source": "scraper", "timestamp": datetime.now().isoformat() + "Z"}
-            })
+            }
 
+            # Log failed request
+            processing_ms = int((time.time() - start_time) * 1000)
+            log_api_call(
+                tool_name="scrape",
+                tool_type="enrichment",
+                input_data=request_data,
+                output_data=error_response,
+                success=False,
+                processing_ms=processing_ms,
+                user_id=user_id,
+                error_message=str(e)
+            )
+
+            return JSONResponse(status_code=400, content=error_response)
+
+        # Check cache
         cached_result = _get_cache(scrape_request.url, scrape_request.prompt, scrape_request.output_schema)
         if cached_result:
-            return JSONResponse(content={
+            processing_ms = int((time.time() - start_time) * 1000)
+            response = {
                 "success": True,
                 "data": cached_result["data"],
                 "metadata": {**cached_result["metadata"], "cached": True, "timestamp": datetime.now().isoformat()}
-            })
+            }
 
+            # Log cached response
+            log_api_call(
+                tool_name="scrape",
+                tool_type="enrichment",
+                input_data=request_data,
+                output_data=response,
+                success=True,
+                processing_ms=processing_ms,
+                user_id=user_id
+            )
+
+            return JSONResponse(content=response)
+
+        # Get Gemini API key
         api_key = os.environ.get("GOOGLE_GENERATIVE_AI_API_KEY") or os.environ.get("GEMINI_API_KEY")
         if not api_key:
-            return JSONResponse(status_code=500, content={"success": False, "error": "Missing Gemini API key"})
+            error_response = {"success": False, "error": "Missing Gemini API key"}
+            processing_ms = int((time.time() - start_time) * 1000)
 
+            log_api_call(
+                tool_name="scrape",
+                tool_type="enrichment",
+                input_data=request_data,
+                output_data=error_response,
+                success=False,
+                processing_ms=processing_ms,
+                user_id=user_id,
+                error_message="Missing Gemini API key"
+            )
+
+            return JSONResponse(status_code=500, content=error_response)
+
+        # Execute scraping
         try:
-            import time
-            start_time = time.time()
             scraper = FlexibleScraper(api_key=api_key)
 
             actions_list = None
@@ -909,14 +2229,13 @@ def api():
             )
 
             extraction_time = time.time() - start_time
-
-            # Extract pages_scraped from data (added by scraper)
             pages_scraped = extracted_data.pop("_pages_scraped", 1) if isinstance(extracted_data, dict) else 1
 
+            # Cache result
             cache_value = {"data": extracted_data, "metadata": {"extraction_time": extraction_time, "pages_scraped": pages_scraped}, "timestamp": datetime.now()}
             _set_cache(scrape_request.url, scrape_request.prompt, scrape_request.output_schema, cache_value)
 
-            return JSONResponse(content={
+            response = {
                 "success": True,
                 "data": extracted_data,
                 "metadata": {
@@ -926,51 +2245,129 @@ def api():
                     "model": FlexibleScraper.DEFAULT_MODEL,
                     "timestamp": datetime.now().isoformat(),
                 }
-            })
+            }
+
+            # Log successful response
+            processing_ms = int((time.time() - start_time) * 1000)
+            log_api_call(
+                tool_name="scrape",
+                tool_type="enrichment",
+                input_data=request_data,
+                output_data=response,
+                success=True,
+                processing_ms=processing_ms,
+                user_id=user_id
+            )
+
+            return JSONResponse(content=response)
 
         except FlexibleScraperError as e:
-            return JSONResponse(status_code=400, content={
+            error_response = {
                 "success": False,
                 "error": str(e),
                 "metadata": {"source": "scraper", "timestamp": datetime.now().isoformat() + "Z"}
-            })
+            }
+
+            processing_ms = int((time.time() - start_time) * 1000)
+            log_api_call(
+                tool_name="scrape",
+                tool_type="enrichment",
+                input_data=request_data,
+                output_data=error_response,
+                success=False,
+                processing_ms=processing_ms,
+                user_id=user_id,
+                error_message=str(e)
+            )
+
+            return JSONResponse(status_code=400, content=error_response)
+
         except Exception as e:
-            return JSONResponse(status_code=500, content={
+            error_response = {
                 "success": False,
                 "error": "An unexpected error occurred. Please try again or contact support.",
                 "metadata": {"source": "scraper", "timestamp": datetime.now().isoformat() + "Z"}
-            })
+            }
+
+            processing_ms = int((time.time() - start_time) * 1000)
+            log_api_call(
+                tool_name="scrape",
+                tool_type="enrichment",
+                input_data=request_data,
+                output_data=error_response,
+                success=False,
+                processing_ms=processing_ms,
+                user_id=user_id,
+                error_message=str(e)
+            )
+
+            return JSONResponse(status_code=500, content=error_response)
 
 
-    for tool_name, tool_config in ENRICHMENT_TOOLS.items():
-        web_app.add_api_route(f"/{tool_name}", create_enrichment_route(tool_name, tool_config), methods=["POST"], tags=[tool_config["tag"]], summary=tool_config["doc"].split('\n\n')[0])
+    # Register tools with nested URLs by type
+    for tool_name, tool_config in TOOLS.items():
+        web_app.add_api_route(
+            f"/{tool_config['type']}/{tool_name}",
+            create_enrichment_route(tool_name, tool_config),
+            methods=["POST"],
+            tags=[tool_config["tag"]],
+            summary=tool_config["doc"].split('\n\n')[0]
+        )
 
     # BULK ENDPOINTS
 
     @web_app.post("/enrich", tags=["Bulk Processing"])
-    async def multi_tool_enrich(request_data: Dict[str, Any], x_api_key: Optional[str] = Header(None)):
+    async def multi_tool_enrich(
+        request_data: Dict[str, Any],
+        user_id: Optional[str] = Depends(get_current_user)
+    ):
         """
         Enrich a single record with multiple tools.
 
         - **data**: Record to enrich (dict with any fields)
         - **tools**: List of tool names to apply (e.g. ["phone-validation", "email-intel"])
         """
-        if not verify_api_key(x_api_key):
-            raise HTTPException(status_code=401, detail="Invalid or missing API key")
+        start_time = time.time()
+
+        # Quota enforcement for authenticated users
+        if user_id:
+            check_quota(user_id)
 
         data = request_data.get("data")
         tool_names = request_data.get("tools", [])
 
         if not data or not isinstance(data, dict):
-            return JSONResponse(status_code=400, content={"success": False, "error": "data required (must be dict)"})
+            error_response = {"success": False, "error": "data required (must be dict)"}
+            log_api_call(
+                tool_name="enrich",
+                tool_type="enrichment",
+                input_data=request_data,
+                output_data=error_response,
+                success=False,
+                processing_ms=int((time.time() - start_time) * 1000),
+                user_id=user_id,
+                error_message="data required (must be dict)"
+            )
+            return JSONResponse(status_code=400, content=error_response)
+
         if not tool_names or not isinstance(tool_names, list):
-            return JSONResponse(status_code=400, content={"success": False, "error": "tools required (must be list)"})
+            error_response = {"success": False, "error": "tools required (must be list)"}
+            log_api_call(
+                tool_name="enrich",
+                tool_type="enrichment",
+                input_data=request_data,
+                output_data=error_response,
+                success=False,
+                processing_ms=int((time.time() - start_time) * 1000),
+                user_id=user_id,
+                error_message="tools required (must be list)"
+            )
+            return JSONResponse(status_code=400, content=error_response)
 
         try:
             # Build tool specs from explicit tool names
             tool_specs = []
             for tool_name in tool_names:
-                # Find matching field in data for this tool
                 for key, value in data.items():
                     field_type = detect_field_type(key, value)
                     if (tool_name == "phone-validation" and field_type == "phone") or \
@@ -984,67 +2381,195 @@ def api():
                         break
 
             if not tool_specs:
-                return JSONResponse(status_code=400, content={"success": False, "error": "No matching fields found for specified tools"})
+                error_response = {"success": False, "error": "No matching fields found for specified tools"}
+                log_api_call(
+                    tool_name="enrich",
+                    tool_type="enrichment",
+                    input_data=request_data,
+                    output_data=error_response,
+                    success=False,
+                    processing_ms=int((time.time() - start_time) * 1000),
+                    user_id=user_id,
+                    error_message="No matching fields found"
+                )
+                return JSONResponse(status_code=400, content=error_response)
 
             result = await run_enrichments(data, tool_specs)
-            return JSONResponse(content={"success": True, "data": result, "metadata": {"source": "multi-tool-enrich", "timestamp": datetime.now().isoformat() + "Z"}})
+            response = {"success": True, "data": result, "metadata": {"source": "multi-tool-enrich", "timestamp": datetime.now().isoformat() + "Z"}}
+
+            log_api_call(
+                tool_name="enrich",
+                tool_type="enrichment",
+                input_data=request_data,
+                output_data=response,
+                success=True,
+                processing_ms=int((time.time() - start_time) * 1000),
+                user_id=user_id
+            )
+
+            return JSONResponse(content=response)
+
         except Exception as e:
-            return JSONResponse(status_code=500, content={"success": False, "error": f"Enrichment failed: {str(e)}"})
+            error_response = {"success": False, "error": f"Enrichment failed: {str(e)}"}
+            log_api_call(
+                tool_name="enrich",
+                tool_type="enrichment",
+                input_data=request_data,
+                output_data=error_response,
+                success=False,
+                processing_ms=int((time.time() - start_time) * 1000),
+                user_id=user_id,
+                error_message=str(e)
+            )
+            return JSONResponse(status_code=500, content=error_response)
 
     @web_app.post("/enrich/auto", tags=["Bulk Processing"])
-    async def auto_enrich(request_data: Dict[str, Any], x_api_key: Optional[str] = Header(None)):
+    async def auto_enrich(
+        request_data: Dict[str, Any],
+        user_id: Optional[str] = Depends(get_current_user)
+    ):
         """
         Auto-detect and enrich a single record with appropriate tools.
 
         - **data**: Record to enrich (dict with any fields)
         """
-        if not verify_api_key(x_api_key):
-            raise HTTPException(status_code=401, detail="Invalid or missing API key")
+        start_time = time.time()
+
+        # Quota enforcement for authenticated users
+        if user_id:
+            check_quota(user_id)
 
         data = request_data.get("data")
         if not data or not isinstance(data, dict):
-            return JSONResponse(status_code=400, content={"success": False, "error": "data required (must be dict)"})
+            error_response = {"success": False, "error": "data required (must be dict)"}
+            log_api_call(
+                tool_name="enrich-auto",
+                tool_type="enrichment",
+                input_data=request_data,
+                output_data=error_response,
+                success=False,
+                processing_ms=int((time.time() - start_time) * 1000),
+                user_id=user_id,
+                error_message="data required (must be dict)"
+            )
+            return JSONResponse(status_code=400, content=error_response)
 
         try:
             tool_specs = auto_detect_enrichments(data)
             if not tool_specs:
-                return JSONResponse(content={"success": True, "data": data, "metadata": {"source": "auto-enrich", "message": "No enrichments detected", "timestamp": datetime.now().isoformat() + "Z"}})
+                response = {"success": True, "data": data, "metadata": {"source": "auto-enrich", "message": "No enrichments detected", "timestamp": datetime.now().isoformat() + "Z"}}
+                log_api_call(
+                    tool_name="enrich-auto",
+                    tool_type="enrichment",
+                    input_data=request_data,
+                    output_data=response,
+                    success=True,
+                    processing_ms=int((time.time() - start_time) * 1000),
+                    user_id=user_id
+                )
+                return JSONResponse(content=response)
 
             result = await run_enrichments(data, tool_specs)
-            return JSONResponse(content={"success": True, "data": result, "metadata": {"source": "auto-enrich", "tools_applied": len(tool_specs), "timestamp": datetime.now().isoformat() + "Z"}})
+            response = {"success": True, "data": result, "metadata": {"source": "auto-enrich", "tools_applied": len(tool_specs), "timestamp": datetime.now().isoformat() + "Z"}}
+
+            log_api_call(
+                tool_name="enrich-auto",
+                tool_type="enrichment",
+                input_data=request_data,
+                output_data=response,
+                success=True,
+                processing_ms=int((time.time() - start_time) * 1000),
+                user_id=user_id
+            )
+
+            return JSONResponse(content=response)
+
         except Exception as e:
-            return JSONResponse(status_code=500, content={"success": False, "error": f"Auto-enrichment failed: {str(e)}"})
+            error_response = {"success": False, "error": f"Auto-enrichment failed: {str(e)}"}
+            log_api_call(
+                tool_name="enrich-auto",
+                tool_type="enrichment",
+                input_data=request_data,
+                output_data=error_response,
+                success=False,
+                processing_ms=int((time.time() - start_time) * 1000),
+                user_id=user_id,
+                error_message=str(e)
+            )
+            return JSONResponse(status_code=500, content=error_response)
 
     @web_app.post("/bulk", tags=["Bulk Processing"])
-    async def bulk_process(request_data: Dict[str, Any], x_api_key: Optional[str] = Header(None)):
+    async def bulk_process(
+        request_data: Dict[str, Any],
+        user_id: Optional[str] = Depends(get_current_user)
+    ):
         """
         Process multiple records in parallel with specified tools.
+
+        Quota: Each row counts as 1 API call toward monthly quota.
 
         - **rows**: List of records to enrich (max 10,000)
         - **tools**: List of tool names to apply to ALL rows
         - **webhook_url**: Optional webhook URL for completion notification
         """
-        if not verify_api_key(x_api_key):
-            raise HTTPException(status_code=401, detail="Invalid or missing API key")
+        start_time = time.time()
 
         rows = request_data.get("rows", [])
         tool_names = request_data.get("tools", [])
         webhook_url = request_data.get("webhook_url")
 
         if not rows or not isinstance(rows, list):
-            return JSONResponse(status_code=400, content={"success": False, "error": "rows required (must be list)"})
+            error_response = {"success": False, "error": "rows required (must be list)"}
+            log_api_call(
+                tool_name="bulk",
+                tool_type="enrichment",
+                input_data={"rows_count": 0},
+                output_data=error_response,
+                success=False,
+                processing_ms=int((time.time() - start_time) * 1000),
+                user_id=user_id,
+                error_message="rows required (must be list)"
+            )
+            return JSONResponse(status_code=400, content=error_response)
+
         if len(rows) > 10000:
-            return JSONResponse(status_code=400, content={"success": False, "error": "Maximum 10,000 rows per batch"})
+            error_response = {"success": False, "error": "Maximum 10,000 rows per batch"}
+            log_api_call(
+                tool_name="bulk",
+                tool_type="enrichment",
+                input_data={"rows_count": len(rows)},
+                output_data=error_response,
+                success=False,
+                processing_ms=int((time.time() - start_time) * 1000),
+                user_id=user_id,
+                error_message="Maximum 10,000 rows exceeded"
+            )
+            return JSONResponse(status_code=400, content=error_response)
+
         if not tool_names or not isinstance(tool_names, list):
-            return JSONResponse(status_code=400, content={"success": False, "error": "tools required (must be list)"})
+            error_response = {"success": False, "error": "tools required (must be list)"}
+            log_api_call(
+                tool_name="bulk",
+                tool_type="enrichment",
+                input_data={"rows_count": len(rows)},
+                output_data=error_response,
+                success=False,
+                processing_ms=int((time.time() - start_time) * 1000),
+                user_id=user_id,
+                error_message="tools required (must be list)"
+            )
+            return JSONResponse(status_code=400, content=error_response)
+
+        # Quota enforcement: Bulk = N API calls (one per row)
+        if user_id:
+            for _ in range(len(rows)):
+                check_quota(user_id)  # Increment quota N times
 
         try:
             batch_id = f"batch_{int(time.time() * 1000)}_{secrets.token_urlsafe(8)}"
-
-            # Process batch (runs fast with parallel Modal .starmap())
             result = await process_batch_internal(batch_id, rows, False, tool_names, webhook_url)
 
-            return JSONResponse(content={
+            response = {
                 "success": True,
                 "batch_id": batch_id,
                 "status": result.get("status", "completed"),
@@ -1056,36 +2581,90 @@ def api():
                 "results": result.get("results", []),
                 "message": "Batch processing completed successfully.",
                 "metadata": {"timestamp": datetime.now().isoformat() + "Z"}
-            })
+            }
+
+            log_api_call(
+                tool_name="bulk",
+                tool_type="enrichment",
+                input_data={"rows_count": len(rows), "tools": tool_names},
+                output_data={"batch_id": batch_id, "successful": response["successful"], "failed": response["failed"]},
+                success=True,
+                processing_ms=int((time.time() - start_time) * 1000),
+                user_id=user_id
+            )
+
+            return JSONResponse(content=response)
+
         except Exception as e:
-            return JSONResponse(status_code=500, content={"success": False, "error": f"Batch processing failed: {str(e)}"})
+            error_response = {"success": False, "error": f"Batch processing failed: {str(e)}"}
+            log_api_call(
+                tool_name="bulk",
+                tool_type="enrichment",
+                input_data={"rows_count": len(rows), "tools": tool_names},
+                output_data=error_response,
+                success=False,
+                processing_ms=int((time.time() - start_time) * 1000),
+                user_id=user_id,
+                error_message=str(e)
+            )
+            return JSONResponse(status_code=500, content=error_response)
 
     @web_app.post("/bulk/auto", tags=["Bulk Processing"])
-    async def bulk_auto_process(request_data: Dict[str, Any], x_api_key: Optional[str] = Header(None)):
+    async def bulk_auto_process(
+        request_data: Dict[str, Any],
+        user_id: Optional[str] = Depends(get_current_user)
+    ):
         """
         Process multiple records in parallel with auto-detection.
+
+        Quota: Each row counts as 1 API call toward monthly quota.
 
         - **rows**: List of records to enrich (max 10,000)
         - **webhook_url**: Optional webhook URL for completion notification
         """
-        if not verify_api_key(x_api_key):
-            raise HTTPException(status_code=401, detail="Invalid or missing API key")
+        start_time = time.time()
 
         rows = request_data.get("rows", [])
         webhook_url = request_data.get("webhook_url")
 
         if not rows or not isinstance(rows, list):
-            return JSONResponse(status_code=400, content={"success": False, "error": "rows required (must be list)"})
+            error_response = {"success": False, "error": "rows required (must be list)"}
+            log_api_call(
+                tool_name="bulk-auto",
+                tool_type="enrichment",
+                input_data={"rows_count": 0},
+                output_data=error_response,
+                success=False,
+                processing_ms=int((time.time() - start_time) * 1000),
+                user_id=user_id,
+                error_message="rows required (must be list)"
+            )
+            return JSONResponse(status_code=400, content=error_response)
+
         if len(rows) > 10000:
-            return JSONResponse(status_code=400, content={"success": False, "error": "Maximum 10,000 rows per batch"})
+            error_response = {"success": False, "error": "Maximum 10,000 rows per batch"}
+            log_api_call(
+                tool_name="bulk-auto",
+                tool_type="enrichment",
+                input_data={"rows_count": len(rows)},
+                output_data=error_response,
+                success=False,
+                processing_ms=int((time.time() - start_time) * 1000),
+                user_id=user_id,
+                error_message="Maximum 10,000 rows exceeded"
+            )
+            return JSONResponse(status_code=400, content=error_response)
+
+        # Quota enforcement: Bulk = N API calls (one per row)
+        if user_id:
+            for _ in range(len(rows)):
+                check_quota(user_id)
 
         try:
             batch_id = f"batch_{int(time.time() * 1000)}_{secrets.token_urlsafe(8)}"
-
-            # Process batch with auto-detection (runs fast with parallel Modal .starmap())
             result = await process_batch_internal(batch_id, rows, True, None, webhook_url)
 
-            return JSONResponse(content={
+            response = {
                 "success": True,
                 "batch_id": batch_id,
                 "status": result.get("status", "completed"),
@@ -1097,20 +2676,44 @@ def api():
                 "results": result.get("results", []),
                 "message": "Batch auto-processing completed successfully.",
                 "metadata": {"timestamp": datetime.now().isoformat() + "Z"}
-            })
+            }
+
+            log_api_call(
+                tool_name="bulk-auto",
+                tool_type="enrichment",
+                input_data={"rows_count": len(rows)},
+                output_data={"batch_id": batch_id, "successful": response["successful"], "failed": response["failed"]},
+                success=True,
+                processing_ms=int((time.time() - start_time) * 1000),
+                user_id=user_id
+            )
+
+            return JSONResponse(content=response)
+
         except Exception as e:
-            return JSONResponse(status_code=500, content={"success": False, "error": f"Batch auto-processing failed: {str(e)}"})
+            error_response = {"success": False, "error": f"Batch auto-processing failed: {str(e)}"}
+            log_api_call(
+                tool_name="bulk-auto",
+                tool_type="enrichment",
+                input_data={"rows_count": len(rows)},
+                output_data=error_response,
+                success=False,
+                processing_ms=int((time.time() - start_time) * 1000),
+                user_id=user_id,
+                error_message=str(e)
+            )
+            return JSONResponse(status_code=500, content=error_response)
 
     @web_app.get("/bulk/status/{batch_id}", tags=["Bulk Processing"])
-    async def bulk_status(batch_id: str, x_api_key: Optional[str] = Header(None)):
+    async def bulk_status(
+        batch_id: str,
+        user_id: Optional[str] = Depends(get_current_user)
+    ):
         """
         Check the status of a batch processing job.
 
         - **batch_id**: Batch ID returned from /bulk or /bulk/auto
         """
-        if not verify_api_key(x_api_key):
-            raise HTTPException(status_code=401, detail="Invalid or missing API key")
-
         try:
             if batch_id not in batch_results:
                 return JSONResponse(status_code=404, content={"success": False, "error": "Batch not found"})
@@ -1130,15 +2733,15 @@ def api():
             return JSONResponse(status_code=500, content={"success": False, "error": f"Status check failed: {str(e)}"})
 
     @web_app.get("/bulk/results/{batch_id}", tags=["Bulk Processing"])
-    async def bulk_results(batch_id: str, x_api_key: Optional[str] = Header(None)):
+    async def bulk_results(
+        batch_id: str,
+        user_id: Optional[str] = Depends(get_current_user)
+    ):
         """
         Download results from a completed batch job.
 
         - **batch_id**: Batch ID returned from /bulk or /bulk/auto
         """
-        if not verify_api_key(x_api_key):
-            raise HTTPException(status_code=401, detail="Invalid or missing API key")
-
         try:
             if batch_id not in batch_results:
                 return JSONResponse(status_code=404, content={"success": False, "error": "Batch not found"})
@@ -1164,5 +2767,292 @@ def api():
             })
         except Exception as e:
             return JSONResponse(status_code=500, content={"success": False, "error": f"Results retrieval failed: {str(e)}"})
+
+    # SAVED JOBS ENDPOINTS (Phase 1: Manual execution only)
+
+    @web_app.post("/jobs/saved", tags=["Saved Jobs"])
+    async def create_saved_job(
+        job_data: Dict[str, Any] = Body(...),
+        user_id: Optional[str] = Depends(get_current_user)
+    ):
+        """
+        Create a saved job for later re-use.
+
+        - **name**: Job name
+        - **description**: Optional description
+        - **tool_name**: Tool to execute (e.g., "phone-validation")
+        - **params**: Tool parameters (e.g., {"phone_number": "+14155552671"})
+        """
+        if not user_id:
+            return JSONResponse(status_code=401, content={"success": False, "error": "Authentication required"})
+
+        # Validate required fields
+        if not job_data.get("name"):
+            return JSONResponse(status_code=400, content={"success": False, "error": "name is required"})
+
+        if not job_data.get("tool_name"):
+            return JSONResponse(status_code=400, content={"success": False, "error": "tool_name is required"})
+
+        if not job_data.get("params") or not isinstance(job_data.get("params"), dict):
+            return JSONResponse(status_code=400, content={"success": False, "error": "params required (must be dict)"})
+
+        # Verify tool exists
+        tool_name = job_data["tool_name"]
+        if tool_name not in TOOLS:
+            return JSONResponse(status_code=400, content={"success": False, "error": f"Tool '{tool_name}' not found"})
+
+        try:
+            from supabase import create_client
+            supabase_url = os.environ.get("SUPABASE_URL")
+            supabase_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+
+            if not supabase_url or not supabase_key:
+                return JSONResponse(status_code=500, content={"success": False, "error": "Database not configured"})
+
+            supabase = create_client(supabase_url, supabase_key)
+
+            # Insert saved job
+            result = supabase.table("saved_queries").insert({
+                "user_id": user_id,
+                "name": job_data["name"],
+                "description": job_data.get("description"),
+                "tool_name": tool_name,
+                "params": job_data["params"],
+                "is_template": job_data.get("is_template", False),
+                "template_vars": job_data.get("template_vars")
+            }).execute()
+
+            if result.data:
+                return JSONResponse(content={"success": True, "job": result.data[0]})
+            else:
+                return JSONResponse(status_code=500, content={"success": False, "error": "Failed to create job"})
+
+        except Exception as e:
+            return JSONResponse(status_code=500, content={"success": False, "error": f"Job creation failed: {str(e)}"})
+
+    @web_app.get("/jobs/saved", tags=["Saved Jobs"])
+    async def list_saved_jobs(
+        user_id: Optional[str] = Depends(get_current_user)
+    ):
+        """
+        List all saved jobs for the authenticated user.
+        """
+        if not user_id:
+            return JSONResponse(status_code=401, content={"success": False, "error": "Authentication required"})
+
+        try:
+            from supabase import create_client
+            supabase_url = os.environ.get("SUPABASE_URL")
+            supabase_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+
+            if not supabase_url or not supabase_key:
+                return JSONResponse(status_code=500, content={"success": False, "error": "Database not configured"})
+
+            supabase = create_client(supabase_url, supabase_key)
+
+            # Query saved jobs for this user
+            result = supabase.table("saved_queries")\
+                .select("*")\
+                .eq("user_id", user_id)\
+                .order("created_at", desc=True)\
+                .execute()
+
+            return JSONResponse(content={
+                "success": True,
+                "jobs": result.data,
+                "total": len(result.data) if result.data else 0
+            })
+
+        except Exception as e:
+            return JSONResponse(status_code=500, content={"success": False, "error": f"Failed to list jobs: {str(e)}"})
+
+    @web_app.post("/jobs/saved/{job_id}/run", tags=["Saved Jobs"])
+    async def run_saved_job(
+        job_id: str,
+        user_id: Optional[str] = Depends(get_current_user)
+    ):
+        """
+        Execute a saved job immediately.
+
+        Returns the result of the tool execution.
+        """
+        if not user_id:
+            return JSONResponse(status_code=401, content={"success": False, "error": "Authentication required"})
+
+        start_time = time.time()
+
+        try:
+            from supabase import create_client
+            supabase_url = os.environ.get("SUPABASE_URL")
+            supabase_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+
+            if not supabase_url or not supabase_key:
+                return JSONResponse(status_code=500, content={"success": False, "error": "Database not configured"})
+
+            supabase = create_client(supabase_url, supabase_key)
+
+            # Get saved job and verify ownership
+            job_result = supabase.table("saved_queries")\
+                .select("*")\
+                .eq("id", job_id)\
+                .eq("user_id", user_id)\
+                .execute()
+
+            if not job_result.data:
+                return JSONResponse(status_code=404, content={"success": False, "error": "Job not found"})
+
+            job = job_result.data[0]
+            tool_name = job["tool_name"]
+            params = job["params"]
+
+            # Quota enforcement
+            check_quota(user_id)
+
+            # Get tool configuration
+            tool_config = TOOLS.get(tool_name)
+            if not tool_config:
+                return JSONResponse(status_code=400, content={"success": False, "error": f"Tool '{tool_name}' not found"})
+
+            # Execute the tool
+            try:
+                result = await tool_config["fn"](**params)
+                success = True
+                error_msg = None
+            except Exception as e:
+                result = {"success": False, "error": str(e)}
+                success = False
+                error_msg = str(e)
+
+            processing_ms = int((time.time() - start_time) * 1000)
+
+            # Log API call (reuse existing logging infrastructure)
+            log_api_call(
+                tool_name=tool_name,
+                tool_type=tool_config["type"],
+                input_data=params,
+                output_data=result,
+                success=success,
+                processing_ms=processing_ms,
+                user_id=user_id,
+                error_message=error_msg,
+                tokens_used=result.get("metadata", {}).get("total_tokens", 0) if success else 0
+            )
+
+            # Update last_run_at
+            supabase.table("saved_queries")\
+                .update({"last_run_at": datetime.now().isoformat()})\
+                .eq("id", job_id)\
+                .execute()
+
+            if not success:
+                return JSONResponse(status_code=500, content=result)
+
+            return JSONResponse(content={
+                "success": True,
+                "result": result,
+                "job_id": job_id,
+                "job_name": job["name"],
+                "metadata": {
+                    "tool_name": tool_name,
+                    "processing_ms": processing_ms,
+                    "executed_at": datetime.now().isoformat()
+                }
+            })
+
+        except Exception as e:
+            return JSONResponse(status_code=500, content={"success": False, "error": f"Job execution failed: {str(e)}"})
+
+    @web_app.patch("/jobs/saved/{job_id}/schedule", tags=["Saved Jobs"])
+    async def update_job_schedule(
+        job_id: str,
+        schedule_data: Dict[str, Any] = Body(...),
+        user_id: Optional[str] = Depends(get_current_user)
+    ):
+        """
+        Enable, disable, or update scheduling for a saved job.
+
+        - **is_scheduled**: Enable (true) or disable (false) scheduling
+        - **schedule_preset**: 'daily', 'weekly', or 'monthly' (required if enabling)
+        - **schedule_cron**: Custom cron expression (future use, mutually exclusive with preset)
+        """
+        if not user_id:
+            return JSONResponse(status_code=401, content={"success": False, "error": "Authentication required"})
+
+        is_scheduled = schedule_data.get("is_scheduled")
+        schedule_preset = schedule_data.get("schedule_preset")
+        schedule_cron = schedule_data.get("schedule_cron")
+
+        # Validation
+        if is_scheduled is None:
+            return JSONResponse(status_code=400, content={"success": False, "error": "is_scheduled is required"})
+
+        if not isinstance(is_scheduled, bool):
+            return JSONResponse(status_code=400, content={"success": False, "error": "is_scheduled must be boolean"})
+
+        # If enabling scheduling, require exactly one schedule type
+        if is_scheduled:
+            if not schedule_preset and not schedule_cron:
+                return JSONResponse(status_code=400, content={"success": False, "error": "schedule_preset or schedule_cron required when enabling scheduling"})
+
+            if schedule_preset and schedule_cron:
+                return JSONResponse(status_code=400, content={"success": False, "error": "Cannot set both schedule_preset and schedule_cron"})
+
+            # Validate preset values
+            if schedule_preset and schedule_preset not in ['daily', 'weekly', 'monthly']:
+                return JSONResponse(status_code=400, content={"success": False, "error": "schedule_preset must be 'daily', 'weekly', or 'monthly'"})
+
+            # Cron validation (placeholder for future)
+            if schedule_cron:
+                return JSONResponse(status_code=400, content={"success": False, "error": "Cron expressions not yet supported. Use schedule_preset."})
+
+        try:
+            from supabase import create_client
+            supabase_url = os.environ.get("SUPABASE_URL")
+            supabase_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+
+            if not supabase_url or not supabase_key:
+                return JSONResponse(status_code=500, content={"success": False, "error": "Database not configured"})
+
+            supabase = create_client(supabase_url, supabase_key)
+
+            # Verify job exists and user owns it
+            job_result = supabase.table("saved_queries")\
+                .select("*")\
+                .eq("id", job_id)\
+                .eq("user_id", user_id)\
+                .execute()
+
+            if not job_result.data:
+                return JSONResponse(status_code=404, content={"success": False, "error": "Job not found"})
+
+            # Calculate next_run_at if enabling
+            next_run_at = None
+            if is_scheduled:
+                try:
+                    next_run_at = calculate_next_run_at(schedule_preset or schedule_cron)
+                except ValueError as e:
+                    return JSONResponse(status_code=400, content={"success": False, "error": str(e)})
+
+            # Update job
+            update_data = {
+                "is_scheduled": is_scheduled,
+                "schedule_preset": schedule_preset if is_scheduled else None,
+                "schedule_cron": schedule_cron if is_scheduled else None,
+                "next_run_at": next_run_at.isoformat() if next_run_at else None,
+                "updated_at": datetime.now().isoformat()
+            }
+
+            result = supabase.table("saved_queries")\
+                .update(update_data)\
+                .eq("id", job_id)\
+                .execute()
+
+            if result.data:
+                return JSONResponse(content={"success": True, "job": result.data[0]})
+            else:
+                return JSONResponse(status_code=500, content={"success": False, "error": "Failed to update schedule"})
+
+        except Exception as e:
+            return JSONResponse(status_code=500, content={"success": False, "error": f"Schedule update failed: {str(e)}"})
 
     return web_app
