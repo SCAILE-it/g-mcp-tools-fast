@@ -709,6 +709,7 @@ class ToolExecutor:
                 "success": False,
                 "tool_name": tool_name,
                 "error": f"Tool '{tool_name}' not found in registry",
+                "error_type": "KeyError",
                 "execution_time_ms": (time.time() - start_time) * 1000
             }
 
@@ -728,6 +729,7 @@ class ToolExecutor:
                 "tool_type": tool_type,
                 "tool_tag": tool_tag,
                 "error": str(e),
+                "error_type": "ValueError",
                 "execution_time_ms": (time.time() - start_time) * 1000
             }
 
@@ -758,6 +760,7 @@ class ToolExecutor:
                 "tool_type": tool_type,
                 "tool_tag": tool_tag,
                 "error": str(e),
+                "error_type": type(e).__name__,
                 "execution_time_ms": execution_time
             }
 
@@ -874,6 +877,49 @@ class ErrorClassifier:
         # Default to unknown (no retry)
         return ErrorCategory.UNKNOWN
 
+    @staticmethod
+    def categorize_by_type(error_type: str, error_msg: str) -> ErrorCategory:
+        """
+        Categorize error by type name and message (for ToolExecutor results).
+
+        Args:
+            error_type: Exception type name (e.g., "TimeoutError", "ValueError")
+            error_msg: Error message string
+
+        Returns:
+            ErrorCategory enum value
+        """
+        error_msg_lower = error_msg.lower()
+
+        # Transient network errors
+        if error_type in ["TimeoutError", "Timeout", "ConnectionError"]:
+            return ErrorCategory.TRANSIENT
+
+        # Permanent validation errors
+        if error_type == "ValueError":
+            return ErrorCategory.PERMANENT
+
+        # Check HTTP status codes in message
+        if "http error" in error_msg_lower or "status code" in error_msg_lower:
+            # Rate limiting
+            if "429" in error_msg or "rate limit" in error_msg_lower:
+                return ErrorCategory.RATE_LIMIT
+
+            # Transient server errors
+            if any(code in error_msg for code in ["503", "504", "502"]):
+                return ErrorCategory.TRANSIENT
+
+            # Permanent client errors
+            if any(code in error_msg for code in ["400", "401", "403", "404", "405"]):
+                return ErrorCategory.PERMANENT
+
+        # Check timeout in message
+        if "timeout" in error_msg_lower or "timed out" in error_msg_lower:
+            return ErrorCategory.TRANSIENT
+
+        # Default to unknown
+        return ErrorCategory.UNKNOWN
+
 
 from dataclasses import dataclass, field
 
@@ -951,37 +997,16 @@ class ErrorHandler:
                 return result
 
             # Failure - check if we should retry
-            last_error = result.get("error", "Unknown error")
-
-            # Don't retry if we've exhausted attempts
             if attempt >= self.config.max_retries:
                 break
 
-            # Categorize the error to decide if we should retry
-            try:
-                # Recreate exception from error string for classification
-                error_msg = last_error
+            # Categorize error using type and message from ToolExecutor
+            error_type = result.get("error_type", "Exception")
+            error_msg = result.get("error", "Unknown error")
+            error_category = ErrorClassifier.categorize_by_type(error_type, error_msg)
 
-                # Try to determine exception type from error message
-                if "timeout" in error_msg.lower() or "timed out" in error_msg.lower():
-                    exception = asyncio.TimeoutError(error_msg)
-                elif "missing required parameter" in error_msg.lower() or "invalid" in error_msg.lower():
-                    exception = ValueError(error_msg)
-                elif "429" in error_msg or "rate limit" in error_msg.lower():
-                    exception = RuntimeError(error_msg)
-                elif any(code in error_msg for code in ["503", "504", "502"]):
-                    exception = RuntimeError(error_msg)
-                else:
-                    exception = Exception(error_msg)
-
-                error_category = ErrorClassifier.categorize(exception)
-            except Exception:
-                # If classification fails, default to UNKNOWN (no retry)
-                error_category = ErrorCategory.UNKNOWN
-
-            # Check if this error type should be retried
+            # Don't retry permanent or unknown errors
             if error_category not in self.config.retry_on:
-                # Don't retry permanent or unknown errors
                 result["retry_count"] = retry_count
                 return result
 
