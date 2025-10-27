@@ -1065,6 +1065,382 @@ class ErrorHandler:
         return result
 
 
+# ============================================================================
+# PHASE 3.4: ORCHESTRATOR + SSE STREAMING
+# ============================================================================
+
+class StepParser:
+    """
+    Parse natural language plan steps into executable tool calls.
+
+    Single Responsibility: Convert human-readable steps to {tool_name, params} JSON.
+    Uses Gemini API for intelligent parsing with tool registry context.
+    """
+
+    def __init__(self, tools: Dict[str, Any], api_key: Optional[str] = None):
+        """
+        Initialize StepParser with tools registry.
+
+        Args:
+            tools: TOOLS registry dict {tool_name: {fn, type, params, ...}}
+            api_key: Optional Gemini API key (uses env var if not provided)
+        """
+        self.tools = tools
+
+        # Initialize Gemini API
+        if api_key is None:
+            api_key = os.getenv("GOOGLE_GENERATIVE_AI_API_KEY") or os.getenv("GEMINI_API_KEY")
+
+        if api_key:
+            import google.generativeai as genai
+            genai.configure(api_key=api_key)
+            self.genai = genai
+        else:
+            # Fallback: Will be set later by Modal secrets
+            self.genai = None
+
+    async def _call_gemini(self, step_description: str, tools_context: str) -> str:
+        """
+        Call Gemini API to parse step into tool call JSON.
+
+        Args:
+            step_description: Natural language step (e.g., "Use email-intel to validate test@gmail.com")
+            tools_context: Available tools context for Gemini
+
+        Returns:
+            JSON string: {"tool_name": "...", "params": {...}}
+
+        Raises:
+            Exception: If Gemini API call fails
+        """
+        # Lazy init genai if not done in __init__
+        if self.genai is None:
+            api_key = os.getenv("GOOGLE_GENERATIVE_AI_API_KEY") or os.getenv("GEMINI_API_KEY")
+            import google.generativeai as genai
+            genai.configure(api_key=api_key)
+            self.genai = genai
+
+        prompt = f"""You are a tool call parser. Parse the following step into a JSON tool call.
+
+Available tools:
+{tools_context}
+
+Step: {step_description}
+
+INSTRUCTIONS:
+1. Identify which tool best matches the step description
+2. Extract ALL parameter VALUES mentioned in the step description
+3. Include ALL REQUIRED parameters (marked [REQUIRED])
+4. For parameters not mentioned in the step, omit them from the JSON
+
+Return ONLY valid JSON in this format:
+{{"tool_name": "tool-name", "params": {{"param1": "value1", "param2": "value2"}}}}
+
+EXAMPLE:
+Step: "Validate the phone number +14155551234"
+Available tool: phone-validation with parameters: phone_number (str) [REQUIRED]
+Correct JSON: {{"tool_name": "phone-validation", "params": {{"phone_number": "+14155551234"}}}}
+
+If the step doesn't match any tool, return:
+{{"error": "No matching tool found"}}"""
+
+        model = self.genai.GenerativeModel("gemini-2.0-flash-exp")
+        response = await asyncio.to_thread(
+            model.generate_content,
+            prompt,
+            generation_config=self.genai.GenerationConfig(
+                temperature=0.1,
+                max_output_tokens=500
+            )
+        )
+
+        return response.text.strip()
+
+    async def parse_step(self, step_description: str) -> Dict[str, Any]:
+        """
+        Parse a natural language step into a tool call.
+
+        Args:
+            step_description: Human-readable step description
+
+        Returns:
+            {
+                "success": True,
+                "tool_name": "tool-name",
+                "params": {"param1": "value1", ...}
+            }
+            OR
+            {
+                "success": False,
+                "error": "Error message"
+            }
+        """
+        try:
+            # Build tools context for Gemini WITH PARAMETER SCHEMAS (ROOT CAUSE FIX)
+            # Previous bug: Only sent tool names and tags, Gemini had no idea what params to extract
+            tools_context_parts = []
+            for name, meta in self.tools.items():
+                # Get description
+                description = meta.get('tag', meta.get('doc', 'No description'))
+
+                # Get parameter schema from TOOLS registry
+                params_list = meta.get('params', [])
+                if params_list:
+                    param_specs = []
+                    for param_tuple in params_list:
+                        param_name = param_tuple[0]
+                        param_type = param_tuple[1].__name__ if len(param_tuple) > 1 else 'str'
+                        param_required = param_tuple[2] if len(param_tuple) > 2 else False
+
+                        spec = f"{param_name} ({param_type})"
+                        if param_required:
+                            spec += " [REQUIRED]"
+                        else:
+                            spec += " [optional]"
+                        param_specs.append(spec)
+
+                    params_str = ", ".join(param_specs)
+                    tool_info = f"- {name}: {description}\n  Parameters: {params_str}"
+                else:
+                    tool_info = f"- {name}: {description}\n  Parameters: none"
+
+                tools_context_parts.append(tool_info)
+
+            tools_context = "\n".join(tools_context_parts)
+
+            # Call Gemini to parse step
+            gemini_response = await self._call_gemini(step_description, tools_context)
+
+            # Parse JSON response
+            import json
+            # Remove markdown code blocks if present
+            gemini_response = gemini_response.replace("```json", "").replace("```", "").strip()
+            parsed = json.loads(gemini_response)
+
+            # Check if Gemini returned an error
+            if "error" in parsed:
+                return {
+                    "success": False,
+                    "error": parsed["error"]
+                }
+
+            # Validate tool exists
+            tool_name = parsed.get("tool_name")
+            if not tool_name or tool_name not in self.tools:
+                return {
+                    "success": False,
+                    "error": f"Tool '{tool_name}' not found in registry"
+                }
+
+            # Return successful parse
+            return {
+                "success": True,
+                "tool_name": tool_name,
+                "params": parsed.get("params", {})
+            }
+
+        except Exception as e:
+            return {
+                "success": False,
+                "error": f"Failed to parse step: {str(e)}"
+            }
+
+
+class Orchestrator:
+    """
+    Orchestrate full AI workflow: Planner → StepParser → ToolExecutor → ErrorHandler → PlanTracker.
+
+    Composition Pattern: Wraps all Phase 3 components without inheritance.
+    Coordinates execution with retry/fallback and progress tracking.
+    """
+
+    def __init__(
+        self,
+        tools: Dict[str, Any],
+        planner: Optional['Planner'] = None,
+        step_parser: Optional['StepParser'] = None,
+        executor: Optional['ToolExecutor'] = None,
+        error_handler: Optional['ErrorHandler'] = None
+    ):
+        """
+        Initialize Orchestrator with all Phase 3 components.
+
+        Dependency Injection: Accepts optional components for testing (SOLID principle).
+
+        Args:
+            tools: TOOLS registry dict
+            planner: Optional Planner instance (for testing)
+            step_parser: Optional StepParser instance (for testing)
+            executor: Optional ToolExecutor instance (for testing)
+            error_handler: Optional ErrorHandler instance (for testing)
+        """
+        self.tools = tools
+        self.planner = planner or Planner()
+        self.step_parser = step_parser or StepParser(tools)
+        self.executor = executor or ToolExecutor(tools)
+        self.error_handler = error_handler or ErrorHandler(self.executor, RetryConfig())
+
+    async def execute_plan(self, user_request: str) -> Dict[str, Any]:
+        """
+        Execute a complete plan without streaming (blocking).
+
+        Args:
+            user_request: User's natural language request
+
+        Returns:
+            {
+                "success": True,
+                "total_steps": int,
+                "results": [step_result1, step_result2, ...],
+                "plan_tracker": tracker_state
+            }
+        """
+        # Step 1: Generate plan (Planner.generate is sync, not async)
+        plan_steps = self.planner.generate(user_request)
+
+        # Step 2: Initialize tracker
+        tracker = PlanTracker(plan_steps)
+
+        # Step 3: Execute each step
+        results = []
+        for i, step_desc in enumerate(plan_steps):
+            # Start step
+            tracker.start_step(i)
+
+            # Parse step to tool call
+            parsed = await self.step_parser.parse_step(step_desc)
+
+            if not parsed["success"]:
+                # Failed to parse - mark as failed
+                tracker.fail_step(i, parsed["error"])
+                results.append(parsed)
+                continue
+
+            # Execute tool with retry/fallback
+            result = await self.error_handler.execute_with_retry(
+                parsed["tool_name"],
+                parsed["params"]
+            )
+
+            # Update tracker
+            if result["success"]:
+                tracker.complete_step(i)
+            else:
+                tracker.fail_step(i, result.get("error", "Unknown error"))
+
+            results.append(result)
+
+        # Return final result
+        return {
+            "success": True,
+            "total_steps": len(plan_steps),
+            "results": results,
+            "plan_tracker": tracker.to_dict()
+        }
+
+    async def execute_plan_stream(self, user_request: str):
+        """
+        Execute plan with SSE streaming (yields events).
+
+        Yields SSE events:
+        - plan_init: {"event": "plan_init", "data": {"steps": [...], "total": N}}
+        - step_start: {"event": "step_start", "data": {"index": i, "description": "..."}}
+        - step_complete: {"event": "step_complete", "data": {"index": i, "success": bool, "result": {...}}}
+        - complete: {"event": "complete", "data": {"total_steps": N, "successful": M, "failed": K}}
+
+        Args:
+            user_request: User's natural language request
+
+        Yields:
+            Dict[str, Any]: SSE event objects
+        """
+        # Step 1: Generate plan (Planner.generate is sync, not async)
+        plan_steps = self.planner.generate(user_request)
+
+        # Step 2: Initialize tracker
+        tracker = PlanTracker(plan_steps)
+
+        # Yield plan_init event
+        yield {
+            "event": "plan_init",
+            "data": {
+                "steps": plan_steps,
+                "total": len(plan_steps)
+            }
+        }
+
+        # Step 3: Execute each step and stream events
+        successful = 0
+        failed = 0
+
+        for i, step_desc in enumerate(plan_steps):
+            # Yield step_start event
+            yield {
+                "event": "step_start",
+                "data": {
+                    "index": i,
+                    "description": step_desc
+                }
+            }
+
+            # Start step
+            tracker.start_step(i)
+
+            # Parse step to tool call
+            parsed = await self.step_parser.parse_step(step_desc)
+
+            if not parsed["success"]:
+                # Failed to parse
+                tracker.fail_step(i, parsed["error"])
+                failed += 1
+
+                yield {
+                    "event": "step_complete",
+                    "data": {
+                        "index": i,
+                        "success": False,
+                        "error": parsed["error"]
+                    }
+                }
+                continue
+
+            # Execute tool with retry/fallback
+            result = await self.error_handler.execute_with_retry(
+                parsed["tool_name"],
+                parsed["params"]
+            )
+
+            # Update tracker and counters
+            if result["success"]:
+                tracker.complete_step(i)
+                successful += 1
+            else:
+                tracker.fail_step(i, result.get("error", "Unknown error"))
+                failed += 1
+
+            # Yield step_complete event
+            yield {
+                "event": "step_complete",
+                "data": {
+                    "index": i,
+                    "success": result["success"],
+                    "result": result.get("data") if result["success"] else None,
+                    "error": result.get("error") if not result["success"] else None
+                }
+            }
+
+        # Yield complete event
+        yield {
+            "event": "complete",
+            "data": {
+                "total_steps": len(plan_steps),
+                "successful": successful,
+                "failed": failed,
+                "plan_tracker": tracker.to_dict()
+            }
+        }
+
+
 def extract_citations_from_grounding(response: Any, max_results: int = 10) -> List[Dict[str, str]]:
     """
     Extract citations from Gemini response.
@@ -2315,8 +2691,9 @@ TOOLS = {
 def api():
     import time
     from fastapi import FastAPI, Header, HTTPException, Body, Depends, Request
-    from fastapi.responses import JSONResponse
+    from fastapi.responses import JSONResponse, StreamingResponse
     from fastapi.openapi.utils import get_openapi
+    import json
 
     web_app = FastAPI(
         title="g-mcp-tools-fast",
@@ -2561,6 +2938,100 @@ def api():
                     status_code=400,
                     content=result
                 )
+        except Exception as e:
+            return JSONResponse(
+                status_code=500,
+                content={"success": False, "error": str(e)}
+            )
+
+    @web_app.post("/orchestrate", tags=["AI Orchestration"])
+    async def orchestrate_route(
+        request_data: Dict[str, Any] = Body(...),
+        user_id: Optional[str] = Depends(get_current_user)
+    ):
+        """
+        Orchestrate full AI workflow with SSE streaming.
+
+        Phase 3.4: Orchestrator + SSE - Full AI orchestration with real-time progress updates.
+
+        - **user_request**: Natural language task description
+        - **stream**: Enable SSE streaming (default: true)
+
+        SSE Events:
+        - **plan_init**: Initial plan with steps
+        - **step_start**: Step execution started
+        - **step_complete**: Step execution completed (with result or error)
+        - **complete**: All steps finished
+
+        Returns:
+            StreamingResponse with SSE events (if stream=true)
+            OR blocking JSON response (if stream=false)
+        """
+        try:
+            user_request = request_data.get("user_request")
+            stream_mode = request_data.get("stream", True)
+
+            if not user_request:
+                return JSONResponse(
+                    status_code=400,
+                    content={"success": False, "error": "Missing required field: user_request"}
+                )
+
+            # Quota enforcement for authenticated users
+            if user_id:
+                check_quota(user_id)
+
+            # Initialize Orchestrator with TOOLS registry
+            orchestrator = Orchestrator(TOOLS)
+
+            # Streaming mode (SSE)
+            if stream_mode:
+                async def event_generator():
+                    """Generate SSE events from orchestrator stream."""
+                    try:
+                        async for event in orchestrator.execute_plan_stream(user_request):
+                            # Format as SSE event
+                            event_type = event.get("event", "message")
+                            event_data = event.get("data", {})
+
+                            # SSE format: event: [type]\ndata: [json]\n\n
+                            sse_message = f"event: {event_type}\ndata: {json.dumps(event_data)}\n\n"
+                            yield sse_message
+
+                    except Exception as e:
+                        # Send error event
+                        error_event = f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
+                        yield error_event
+
+                return StreamingResponse(
+                    event_generator(),
+                    media_type="text/event-stream",
+                    headers={
+                        "Cache-Control": "no-cache",
+                        "Connection": "keep-alive",
+                        "X-Accel-Buffering": "no"  # Disable nginx buffering
+                    }
+                )
+
+            # Blocking mode (regular JSON response)
+            else:
+                result = await orchestrator.execute_plan(user_request)
+
+                # Log usage for authenticated users
+                if user_id:
+                    log_api_call(
+                        user_id=user_id,
+                        tool_name="orchestrator",
+                        tool_type="ai_orchestration",
+                        input_data={"user_request": user_request},
+                        output_data=result,
+                        success=result["success"],
+                        processing_ms=0,  # Not tracked in blocking mode
+                        error_message=None
+                    )
+
+                return result
+
         except Exception as e:
             return JSONResponse(
                 status_code=500,
