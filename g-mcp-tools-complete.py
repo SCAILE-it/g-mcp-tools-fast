@@ -86,6 +86,14 @@ class ScrapeRequest(BaseModel):
         return v.strip()
 
 
+class ExecuteRequest(BaseModel):
+    """Request for /execute endpoint - single-tool batch processing with SSE streaming."""
+    executionId: str
+    tool: str
+    data: List[Dict[str, Any]]
+    params: Dict[str, Any] = {}
+
+
 # CACHING & HELPERS
 
 _cache: Dict[str, tuple[Any, datetime]] = {}
@@ -2440,6 +2448,79 @@ async def process_batch_parallel(
     return summary
 
 
+async def process_rows_with_progress(
+    tool_name: str,
+    rows: List[Dict[str, Any]],
+    params: Dict[str, Any]
+):
+    """
+    Process rows with single tool, yielding progress events.
+
+    Args:
+        tool_name: Tool to execute (from TOOLS registry)
+        rows: List of row dictionaries
+        params: Tool-specific parameters
+
+    Yields SSE events:
+        - {"event": "progress", "data": {"processed": N, "total": M, "percentage": P}}
+        - {"event": "result", "data": {"results": [...], "summary": {...}, "success": bool}}
+    """
+    total = len(rows)
+    results = []
+    executor = ToolExecutor(TOOLS)
+
+    # Get tool metadata
+    tool_config = TOOLS.get(tool_name, {})
+    tool_type = tool_config.get("type", "unknown")
+
+    # Process rows in chunks for progress updates
+    CHUNK_SIZE = 10
+    for i in range(0, total, CHUNK_SIZE):
+        chunk = rows[i:i + CHUNK_SIZE]
+
+        # Process chunk
+        for row_idx, row in enumerate(chunk):
+            # Build params for this row (merge row data + provided params)
+            row_params = {**params, **row}
+
+            # Execute tool
+            result = await executor.execute(tool_name, row_params)
+            results.append({
+                "row_index": i + row_idx,
+                "success": result["success"],
+                "data": result.get("data"),
+                "error": result.get("error")
+            })
+
+        # Emit progress
+        processed = min(i + CHUNK_SIZE, total)
+        percentage = int((processed / total) * 100)
+        yield {
+            "event": "progress",
+            "data": {
+                "processed": processed,
+                "total": total,
+                "percentage": percentage
+            }
+        }
+
+    # Emit final result
+    successful = sum(1 for r in results if r["success"])
+    failed = total - successful
+    yield {
+        "event": "result",
+        "data": {
+            "results": results,
+            "summary": {
+                "total": total,
+                "successful": successful,
+                "failed": failed
+            },
+            "success": failed == 0
+        }
+    }
+
+
 # SCHEDULED WORKER - Executes scheduled jobs automatically
 @app.function(
     image=image,
@@ -2853,50 +2934,101 @@ def api():
                 content={"success": False, "error": str(e)}
             )
 
-    @web_app.post("/execute", tags=["AI Orchestration"])
+    @web_app.post("/execute", tags=["Tool Execution"])
     async def execute_route(
-        request_data: Dict[str, Any] = Body(...),
+        request_data: ExecuteRequest,
         user_id: Optional[str] = Depends(get_current_user)
     ):
         """
-        Execute a tool from the registry.
+        Execute single tool on multiple rows with SSE streaming.
 
-        Phase 3.2: ToolExecutor - Execute single tool with parameters.
+        Request:
+        - **executionId**: Unique execution identifier
+        - **tool**: Tool name (from TOOLS registry)
+        - **data**: Array of rows to process
+        - **params**: Tool-specific parameters
 
-        - **tool_name**: Name of tool to execute (e.g., "email-intel", "phone-validation")
-        - **params**: Parameters dict for the tool
-
-        Returns:
-            - **success**: bool
-            - **tool_name**: Name of executed tool
-            - **tool_type**: Type (enrichment/generation/analysis)
-            - **data** / **error**: Result or error message
-            - **execution_time_ms**: Execution duration
+        SSE Events:
+        - **progress**: Row-level progress updates
+        - **result**: Final results with summary
         """
         try:
-            tool_name = request_data.get("tool_name")
-            params = request_data.get("params", {})
+            # Quota enforcement for authenticated users
+            if user_id:
+                check_quota(user_id)
 
-            if not tool_name:
+            # Validate tool exists
+            if request_data.tool not in TOOLS:
                 return JSONResponse(
                     status_code=400,
-                    content={"success": False, "error": "Missing required field: tool_name"}
+                    content={
+                        "success": False,
+                        "error": f"Tool '{request_data.tool}' not found in registry"
+                    }
                 )
 
-            # Initialize ToolExecutor with TOOLS registry
-            executor = ToolExecutor(TOOLS)
+            # SSE streaming
+            async def event_generator():
+                final_result = None
+                start_time = time.time()
 
-            # Execute tool
-            result = await executor.execute(tool_name, params)
+                try:
+                    async for event in process_rows_with_progress(
+                        request_data.tool,
+                        request_data.data,
+                        request_data.params
+                    ):
+                        event_type = event.get("event", "message")
+                        event_data = event.get("data", {})
 
-            # Return result (success or failure)
-            if result["success"]:
-                return result
-            else:
-                return JSONResponse(
-                    status_code=400,
-                    content=result
-                )
+                        # Track final result for logging
+                        if event_type == "result":
+                            final_result = event_data
+
+                        # Merge type into data for frontend compatibility
+                        event_data_with_type = {"type": event_type, **event_data}
+                        sse_message = f"data: {json.dumps(event_data_with_type)}\n\n"
+                        yield sse_message
+
+                except Exception as e:
+                    # Include type in error event data
+                    error_data = {"type": "error", "error": str(e)}
+                    error_event = f"data: {json.dumps(error_data)}\n\n"
+                    yield error_event
+                    final_result = {"error": str(e), "successful": 0, "failed": len(request_data.data)}
+
+                finally:
+                    # Log usage for authenticated users after streaming completes
+                    if user_id and final_result:
+                        processing_ms = int((time.time() - start_time) * 1000)
+                        tool_config = TOOLS.get(request_data.tool, {})
+                        tool_type = tool_config.get("type", "unknown")
+
+                        log_api_call(
+                            user_id=user_id,
+                            tool_name=request_data.tool,
+                            tool_type=tool_type,
+                            input_data={
+                                "executionId": request_data.executionId,
+                                "total_rows": len(request_data.data),
+                                "params": request_data.params
+                            },
+                            output_data=final_result,
+                            success=final_result.get("success", False),
+                            processing_ms=processing_ms,
+                            error_message=final_result.get("error")
+                        )
+
+            return StreamingResponse(
+                event_generator(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "X-Accel-Buffering": "no",
+                    "Connection": "keep-alive"
+                }
+            )
+
         except Exception as e:
             return JSONResponse(
                 status_code=500,
@@ -2957,11 +3089,15 @@ def api():
                             if event_type == "complete":
                                 final_result = event_data
 
-                            sse_message = f"event: {event_type}\ndata: {json.dumps(event_data)}\n\n"
+                            # Merge type into data for frontend compatibility
+                            event_data_with_type = {"type": event_type, **event_data}
+                            sse_message = f"data: {json.dumps(event_data_with_type)}\n\n"
                             yield sse_message
 
                     except Exception as e:
-                        error_event = f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
+                        # Include type in error event data
+                        error_data = {"type": "error", "error": str(e)}
+                        error_event = f"data: {json.dumps(error_data)}\n\n"
                         yield error_event
                         final_result = {"error": str(e), "successful": 0, "failed": 0}
 
