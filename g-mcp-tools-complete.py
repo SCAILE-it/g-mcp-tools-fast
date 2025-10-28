@@ -30,6 +30,7 @@ image = (
         # Enrichment tools
         "holehe>=1.61",  # Email intel
         "phonenumbers>=8.13",
+        "email-validator>=2.1.0",  # Email validation
         "python-whois>=0.9",
         "requests>=2.31",
         # Supabase integration
@@ -1987,6 +1988,21 @@ Return ONLY the questions, one per line."""
     }
 
 
+@enrichment_tool("email-validator")
+async def validate_email_address(email: str) -> Dict[str, Any]:
+    """Validate email address using DNS-based deliverability check"""
+    from email_validator import validate_email, EmailNotValidError
+
+    validation = validate_email(email, check_deliverability=True)
+
+    return {
+        "email": email,
+        "valid": True,
+        "normalized": validation.normalized,
+        "domain": validation.domain,
+    }
+
+
 # AUTO-DETECTION
 
 FIELD_PATTERNS = {
@@ -2704,6 +2720,7 @@ TOOLS = {
     "email-pattern": {"fn": generate_email_patterns, "type": "enrichment", "params": [("domain", str, True), ("first_name", str, False, None), ("last_name", str, False, None)], "tag": "Email Intelligence", "doc": "Generate common email patterns.\n\n- **domain**: Domain\n- **first_name**: Optional first name\n- **last_name**: Optional last name"},
     "whois": {"fn": lookup_whois, "type": "enrichment", "params": [("domain", str, True)], "tag": "Domain Intelligence", "doc": "WHOIS lookup for domain registration.\n\n- **domain**: Domain to look up"},
     "github-intel": {"fn": analyze_github_profile, "type": "enrichment", "params": [("username", str, True)], "tag": "Developer Intelligence", "doc": "Analyze GitHub user profile.\n\n- **username**: GitHub username"},
+    "email-validate": {"fn": validate_email_address, "type": "enrichment", "params": [("email", str, True)], "tag": "Email Intelligence", "doc": "Validate email with DNS-based deliverability check.\n\n- **email**: Email address to validate"},
 
     # GENERATION TOOLS - Content & research generation (creates NEW content)
     "web-search": {"fn": web_search, "type": "generation", "params": [("query", str, True), ("max_results", int, False, 5)], "tag": "AI Research", "doc": "Web search using Gemini grounding with citations.\n\n- **query**: Search query\n- **max_results**: Max citations (default: 5)"},
