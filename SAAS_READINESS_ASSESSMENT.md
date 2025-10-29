@@ -341,6 +341,744 @@ All critical infrastructure, security, documentation, and quality requirements h
 
 ---
 
+## Production Observability Roadmap
+
+**Date Added:** October 28, 2025
+**Status:** ⚠️ PARTIALLY READY - Critical observability features missing
+**Impact on Frontend:** None (internal backend improvements)
+**Timeline:** 1 day (6-8 hours) for Phase 1
+
+### Current State Analysis
+
+**What Works:**
+- ✅ Basic health check endpoint (`/health`)
+- ✅ 153 error handlers with try/except blocks
+- ✅ Modal.com infrastructure handles auto-scaling
+- ✅ HTTPS enforced, secrets managed via Modal
+- ✅ Pydantic input validation on all endpoints
+
+**What's Missing (Production-Critical):**
+- ❌ **Structured logging** - Currently uses `print()` statements
+- ❌ **Rate limiting** - Gemini API has 10 requests/minute limit
+- ❌ **Request ID tracing** - Cannot correlate logs across distributed system
+- ❌ **Enhanced health checks** - No dependency connectivity tests
+- ⏳ **Code organization** - 5,193 LOC monolith (defer until frontend MVP stable)
+- ⏳ **Input validation framework** - Ad-hoc validation (works but not centralized)
+- ⏳ **CI/CD pipeline** - Manual `modal deploy` only
+
+---
+
+### Phase 1: DO NOW (Before Frontend MVP Complete)
+
+**Timeline:** 1 day (6-8 hours)
+**Risk Level:** LOW - No API surface changes, fully backward compatible
+**Frontend Impact:** ZERO (same endpoints, same responses, better observability)
+
+#### 1. Structured Logging (2-3 hours)
+
+**Why NOW:** Essential for debugging frontend integration issues and production troubleshooting.
+
+**Current Problem:**
+```python
+# Line 2884: Print-based logging (not production-grade)
+print(f"⚠️  API call logging failed: {e}")
+```
+
+**Implementation:**
+```python
+import structlog
+
+logger = structlog.get_logger()
+
+# Replace all print() statements with structured logs
+logger.info("processing_rows",
+    row_count=row_count,
+    execution_id=execution_id,
+    request_id=request_id,
+    user_id=user_id)
+
+logger.error("api_call_logging_failed",
+    error=str(e),
+    request_id=request_id,
+    execution_id=execution_id)
+```
+
+**Benefits:**
+- ✅ Logs aggregatable in monitoring tools (Datadog, New Relic)
+- ✅ Searchable by execution_id, user_id, request_id
+- ✅ Machine-readable JSON format for alerting
+- ✅ Frontend can reference request_id in bug reports
+- ✅ Trace requests across tool executions
+
+**Migration Strategy:** Additive only - existing functionality unchanged
+
+---
+
+#### 2. Rate Limiting (3-4 hours)
+
+**Why NOW:** Protects Gemini API quota (10 req/min) and prevents abuse/DDoS attacks.
+
+**Current Problem:**
+```python
+# Line 834: Rate limit enum defined but NOT ENFORCED
+RATE_LIMIT = "rate_limit"
+```
+
+**Implementation:**
+```python
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+
+limiter = Limiter(key_func=get_remote_address)
+
+@web_app.post("/orchestrate")
+@limiter.limit("10/minute")  # Matches Gemini API limit
+async def orchestrate_route(...):
+    # ... existing logic
+```
+
+**Rate Limits by Endpoint:**
+- `/orchestrate`: **10/minute** (Gemini API constraint)
+- `/execute`: **100/minute** (bulk processing, higher throughput)
+- `/plan`: **20/minute** (AI planning, moderate usage)
+- Individual tools: **50/minute** (reasonable default)
+- `/health`: **Unlimited** (monitoring should never be rate limited)
+
+**Benefits:**
+- ✅ Prevents Gemini API quota exhaustion
+- ✅ Stops abuse and DDoS attempts
+- ✅ Returns clear 429 error with `Retry-After` header
+- ✅ Per-user rate limiting (when authenticated)
+- ✅ Graceful degradation under load
+
+**Frontend Impact:** None unless they spam >10 requests/minute (which would fail anyway without rate limiting)
+
+---
+
+#### 3. Request ID Tracing (1 hour)
+
+**Why NOW:** Critical for debugging distributed system issues and correlating logs.
+
+**Implementation:**
+```python
+import uuid
+from fastapi import Request, Response
+
+@web_app.post("/execute")
+async def execute_route(request: ExecuteRequest):
+    # Generate unique request ID
+    request_id = str(uuid.uuid4())
+
+    logger.info("request_start",
+        request_id=request_id,
+        endpoint="/execute",
+        tool=request.tool)
+
+    try:
+        # ... existing processing logic
+        result = await process_execution(request, request_id)
+
+        # Return request ID in response header
+        return Response(
+            content=result,
+            headers={"X-Request-ID": request_id}
+        )
+    except Exception as e:
+        logger.error("request_failed",
+            request_id=request_id,
+            error=str(e))
+        raise
+```
+
+**Benefits:**
+- ✅ Correlate logs across multiple tool executions
+- ✅ Frontend can include request_id in bug reports
+- ✅ Debug user-specific issues easily
+- ✅ Trace full request lifecycle
+- ✅ Link SSE stream events to original request
+
+**Frontend Impact:** POSITIVE - `X-Request-ID` header enables better debugging
+
+---
+
+#### 4. Enhanced Health Check (30 minutes)
+
+**Why NOW:** Frontend can verify backend dependencies before making requests.
+
+**Current Health Check:**
+```python
+@web_app.get("/health")
+async def health_check():
+    return {"status": "healthy"}
+```
+
+**Enhanced Implementation:**
+```python
+@web_app.get("/health")
+async def health_check():
+    gemini_ok = await test_gemini_connection()
+    supabase_ok = await test_supabase_connection()
+
+    status = "healthy" if gemini_ok and supabase_ok else "degraded"
+
+    return {
+        "status": status,
+        "version": "1.0.0",
+        "timestamp": datetime.utcnow().isoformat(),
+        "dependencies": {
+            "gemini": {
+                "status": "healthy" if gemini_ok else "unavailable",
+                "service": "google-generativeai"
+            },
+            "supabase": {
+                "status": "healthy" if supabase_ok else "unavailable",
+                "service": "supabase-python"
+            },
+            "modal": {
+                "status": "healthy",
+                "service": "modal-platform"
+            }
+        },
+        "metrics": {
+            "total_tools": 14,
+            "workflow_endpoints": 4
+        }
+    }
+
+async def test_gemini_connection() -> bool:
+    """Test Gemini API connectivity."""
+    try:
+        # Simple API call to verify connection
+        response = await gemini_client.generate_content("test")
+        return True
+    except Exception:
+        return False
+
+async def test_supabase_connection() -> bool:
+    """Test Supabase connectivity."""
+    try:
+        # Simple query to verify connection
+        response = supabase.table("api_calls").select("id").limit(1).execute()
+        return True
+    except Exception:
+        return False
+```
+
+**Benefits:**
+- ✅ Detect backend dependency issues proactively
+- ✅ Status page integration (uptime monitoring)
+- ✅ Frontend can show "service degraded" banner
+- ✅ Version tracking for compatibility checks
+- ✅ Metrics for monitoring dashboards
+
+**Frontend Impact:** POSITIVE - Can detect and surface backend issues early
+
+---
+
+### Phase 2: DEFER (After Frontend MVP Stable)
+
+**Timeline:** 2-4 weeks from now (after frontend validates MVP)
+**Why DEFER:** No immediate user-facing value, risk of disruption during active frontend development
+
+#### 1. Code Organization (8-10 hours)
+
+**Current State:** 5,193 LOC monolith in single `g-mcp-tools-complete.py` file
+
+**Target Modular Structure:**
+```
+g-mcp-tools/
+├── app.py                          # FastAPI app initialization + routes
+├── config.py                       # Configuration, secrets, env vars
+├── models/                         # Pydantic schemas
+│   ├── __init__.py
+│   ├── requests.py                 # Request models (ExecuteRequest, etc.)
+│   └── responses.py                # Response models (ToolResponse, etc.)
+├── tools/                          # Tool implementations
+│   ├── __init__.py
+│   ├── enrichment/
+│   │   ├── __init__.py
+│   │   ├── email_intel.py
+│   │   ├── phone_validation.py
+│   │   └── company_data.py
+│   └── generation/
+│       ├── __init__.py
+│       ├── web_search.py
+│       └── blog_create.py
+├── workflows/                      # Workflow system
+│   ├── __init__.py
+│   ├── executor.py                 # WorkflowExecutor class
+│   └── registry.py                 # ToolRegistry class
+├── core/                           # Core orchestration logic
+│   ├── __init__.py
+│   ├── planner.py                  # Planner class
+│   ├── orchestrator.py             # Orchestrator class
+│   ├── step_parser.py              # StepParser class
+│   └── error_handler.py            # ErrorHandler + ErrorClassifier
+├── api/                            # External API integrations
+│   ├── __init__.py
+│   ├── supabase.py                 # Supabase client + helpers
+│   └── gemini.py                   # Gemini client
+├── middleware/                     # FastAPI middleware
+│   ├── __init__.py
+│   ├── rate_limiter.py             # Rate limiting
+│   ├── request_id.py               # Request ID injection
+│   └── logging.py                  # Structured logging setup
+└── tests/
+    ├── __init__.py
+    ├── unit/                       # Unit tests (functions, classes)
+    │   ├── test_planner.py
+    │   ├── test_orchestrator.py
+    │   └── test_error_handler.py
+    └── integration/                # Integration tests (endpoints)
+        ├── test_execute_endpoint.py
+        ├── test_orchestrate_endpoint.py
+        └── test_workflow_system.py
+```
+
+**Benefits:**
+- ✅ Easier maintenance and navigation
+- ✅ Clear ownership of components
+- ✅ Parallel development possible
+- ✅ Better test isolation
+- ✅ Reduced merge conflicts
+
+**Why DEFER:**
+- ❌ Risk of import breakage during migration
+- ❌ No user-facing value (internal structure only)
+- ❌ Frontend doesn't care about backend file organization
+- ❌ Disrupts current development flow
+
+**Do After:** Frontend has stable MVP and integration is proven
+
+---
+
+#### 2. Input Validation Framework (4-6 hours)
+
+**Current State:** Ad-hoc Pydantic validation per endpoint (works but not centralized)
+
+**Target Centralized Validation:**
+```python
+# validators.py
+from pydantic import BaseModel, validator, Field
+
+class EmailValidator:
+    @staticmethod
+    def validate_email(email: str) -> str:
+        # Centralized email validation logic
+        # Returns normalized email or raises ValidationError
+        pass
+
+class PhoneValidator:
+    @staticmethod
+    def validate_phone(phone: str, country: str = "US") -> str:
+        # Centralized phone validation logic
+        pass
+
+# Usage in request models
+class ExecuteRequest(BaseModel):
+    tool: str
+    data: List[Dict[str, Any]]
+
+    @validator('tool')
+    def validate_tool_exists(cls, v):
+        if v not in TOOLS:
+            raise ValueError(f"Unknown tool: {v}")
+        return v
+```
+
+**Benefits:**
+- ✅ Centralized validation logic (DRY)
+- ✅ Consistent error messages
+- ✅ Easier to add new validation rules
+- ✅ Better test coverage
+
+**Why DEFER:**
+- Current ad-hoc validation works reliably
+- Centralized framework might change error message format
+- Could confuse frontend debugging if errors change
+- Not blocking any functionality
+
+**Do After:** Frontend has stable error handling for current format
+
+---
+
+#### 3. CI/CD Pipeline (6-8 hours)
+
+**Current State:** Manual `modal deploy g-mcp-tools-complete.py`
+
+**Target GitHub Actions Pipeline:**
+```yaml
+# .github/workflows/deploy.yml
+name: Deploy to Modal
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest pytest-asyncio
+      - name: Run tests
+        run: pytest tests/ -v
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v3
+      - name: Deploy to Modal
+        env:
+          MODAL_TOKEN: ${{ secrets.MODAL_TOKEN }}
+        run: |
+          pip install modal
+          modal deploy g-mcp-tools-complete.py
+```
+
+**Benefits:**
+- ✅ Automated testing before deploy
+- ✅ Prevent broken deployments
+- ✅ Deployment history and rollback
+- ✅ Faster iteration cycle
+
+**Why DEFER:**
+- Manual deploys work fine for MVP
+- Not blocking any functionality
+- Can set up once development velocity slows
+- Adds complexity during rapid iteration phase
+
+**Do After:** Moving to production with multiple developers
+
+---
+
+### Decision Matrix
+
+| Change | Frontend Impact | Production Value | Phase | Effort |
+|--------|----------------|------------------|-------|--------|
+| **Structured Logging** | ✅ None (better debugging) | 🔥 Critical | **NOW** | 2-3h |
+| **Rate Limiting** | ✅ None (unless abuse) | 🔥 Critical | **NOW** | 3-4h |
+| **Request ID Tracing** | ✅ Positive (debugging) | 🔥 Critical | **NOW** | 1h |
+| **Enhanced Health Check** | ✅ Positive (monitoring) | ⭐ High | **NOW** | 0.5h |
+| **Code Organization** | ⚠️ Risk (import changes) | ⭐ Medium | **DEFER** | 8-10h |
+| **Input Validation Framework** | ⚠️ Risk (error format) | ⭐ Medium | **DEFER** | 4-6h |
+| **CI/CD Pipeline** | ✅ None | ⭐ Low (MVP) | **DEFER** | 6-8h |
+
+**Phase 1 Total:** 6.5-8.5 hours (1 day)
+**Phase 2 Total:** 18-24 hours (3 days) - schedule after frontend MVP stable
+
+---
+
+### Migration Strategy (Zero Downtime)
+
+**Phase 1 Deployment Approach:**
+
+1. **Same Modal Endpoint** - No URL changes for frontend
+   ```bash
+   # Deploy to existing endpoint
+   modal deploy g-mcp-tools-complete.py
+
+   # URL remains: https://scaile--g-mcp-tools-fast-api.modal.run
+   ```
+
+2. **Additive Changes Only**
+   - Logging: Adds structured logs, keeps same responses
+   - Rate limiting: Returns 429 with clear `Retry-After` header if exceeded
+   - Request ID: Adds `X-Request-ID` header (optional for frontend)
+   - Health check: Enhanced fields, maintains `{"status": "healthy"}` contract
+
+3. **Backward Compatibility Guaranteed**
+   - All existing endpoints work identically
+   - Response schemas unchanged
+   - Error formats consistent
+   - No breaking changes
+
+4. **Rollback Plan**
+   ```bash
+   # If issues discovered post-deploy
+   git revert HEAD
+   modal deploy g-mcp-tools-complete.py
+
+   # Rollback time: <2 minutes
+   ```
+
+**Testing Before Deploy:**
+```bash
+# 1. Test locally with Modal CLI
+modal serve g-mcp-tools-complete.py
+
+# 2. Verify same responses (smoke tests)
+curl -X POST "http://localhost:8000/execute" \
+  -H "Content-Type: application/json" \
+  -d '{"executionId":"test","tool":"phone-validation","data":[{"phone_number":"+14155551234"}],"params":{}}'
+
+# 3. Test rate limiting
+for i in {1..15}; do
+  curl -X POST "http://localhost:8000/orchestrate" \
+    -H "Content-Type: application/json" \
+    -d '{"user_request":"test"}'
+  sleep 1
+done
+
+# 4. Deploy to production
+modal deploy g-mcp-tools-complete.py
+
+# 5. Smoke test production
+curl https://scaile--g-mcp-tools-fast-api.modal.run/health
+```
+
+---
+
+### Why This Approach Works
+
+**For Frontend Team:**
+- ✅ Same endpoints, same responses
+- ✅ Better error visibility via request IDs
+- ✅ No breaking changes to handle
+- ✅ Can debug backend issues via structured logs
+- ✅ Proactive health monitoring
+
+**For Backend Team:**
+- ✅ Production-grade observability
+- ✅ Protection from API abuse
+- ✅ Better debugging of frontend integration issues
+- ✅ Foundation for advanced monitoring
+- ✅ Maintains current development velocity
+
+**For Timeline:**
+- ✅ 1 day work vs 4 days (75% time savings)
+- ✅ Low risk (easily reversible)
+- ✅ Immediate production value
+- ✅ Defers code organization until it provides value
+
+---
+
+### Monitoring & Alerting (Post-Phase 1)
+
+**Once Structured Logging Deployed:**
+
+#### 1. Log Aggregation Setup
+
+**Modal Default:** Captures stdout/stderr automatically
+- View via: `modal app logs g-mcp-tools-fast`
+- Searchable in Modal dashboard
+- Retention: 7 days (free tier)
+
+**Advanced Option (Optional):** Integrate with Datadog/New Relic
+```python
+# Add to logging configuration
+import structlog
+
+structlog.configure(
+    processors=[
+        structlog.stdlib.filter_by_level,
+        structlog.processors.TimeStamper(fmt="iso"),
+        structlog.processors.StackInfoRenderer(),
+        structlog.processors.format_exc_info,
+        structlog.processors.JSONRenderer()
+    ]
+)
+```
+
+#### 2. Key Metrics to Track
+
+```
+# Request Volume
+requests_per_minute{endpoint="/execute"}
+requests_per_minute{endpoint="/orchestrate"}
+
+# Error Rates
+error_rate{endpoint="/execute", status="500"}
+error_rate{endpoint="/orchestrate", status="500"}
+
+# Response Times
+response_time_p50{endpoint="/execute"}
+response_time_p95{endpoint="/execute"}
+response_time_p99{endpoint="/orchestrate"}
+
+# Rate Limit Hits
+rate_limit_exceeded{endpoint="/orchestrate", user_id="*"}
+
+# Gemini API Usage
+gemini_requests_per_minute
+gemini_tokens_consumed_per_hour
+
+# Supabase Operations
+supabase_queries_per_minute
+supabase_write_latency_ms
+
+# Health Check Status
+health_check_status{dependency="gemini"}
+health_check_status{dependency="supabase"}
+```
+
+#### 3. Alert Thresholds (Recommended)
+
+**Critical Alerts** (PagerDuty in production):
+- Error rate > 10% for 5 minutes → Page on-call engineer
+- Health check failing for 3 consecutive checks → Page on-call
+- Gemini API quota exhausted → Page on-call
+
+**Warning Alerts** (Slack notifications):
+- Error rate > 5% for 15 minutes → Notify team channel
+- Rate limit hits > 10/hour → Review user quotas
+- Response time p95 > 30s for 10 minutes → Investigate performance
+
+**Info Alerts** (Email):
+- New tool deployed → Notify team
+- Weekly usage summary → Send to stakeholders
+
+#### 4. Dashboard Layout (Modal/Datadog)
+
+**Overview Panel:**
+- Requests per minute (last 24h)
+- Error rate (last 24h)
+- Top 5 most-used tools
+- Current health status
+
+**Performance Panel:**
+- Response time distribution (p50, p95, p99)
+- Request duration heatmap
+- Cache hit rate
+
+**Errors Panel:**
+- Error count by type (last 24h)
+- Failed requests timeline
+- Error log stream (last 100)
+
+**Gemini API Panel:**
+- Requests per minute (vs 10/min limit)
+- Token consumption rate
+- Model response time
+
+---
+
+### Updated Infrastructure Assessment
+
+**After Phase 1 Completion:**
+
+✅ **Deployment:**
+- Platform: Modal.com (serverless, auto-scaling)
+- Uptime: 99.9% SLA (managed by Modal)
+- Scalability: Automatic horizontal scaling
+- Cold start: ~2-3 seconds
+
+✅ **Security:**
+- API key authentication via `x-api-key` header
+- HTTPS enforced by Modal
+- Rate limiting per endpoint (prevents abuse)
+- Input validation via Pydantic models
+- Secrets management via Modal secrets
+
+✅ **Monitoring:**
+- Enhanced health check with dependency tests
+- Structured JSON logging (aggregatable)
+- Request ID tracing across all requests
+- Metrics via Modal dashboard
+- Error tracking with full context
+
+✅ **Performance:**
+- 24-hour caching (reduces costs & latency)
+- Configurable timeouts (30s default, 120s max)
+- Rate limits prevent overload
+- Response times: <100ms (cached), 5-15s (AI extraction)
+
+✅ **Observability:**
+- Centralized structured logging
+- Request correlation via request_id
+- Dependency health monitoring
+- Error classification and tracking
+
+**After Phase 2 Completion:**
+
+✅ **Code Quality:**
+- Modular structure (organized directories)
+- Centralized validation framework
+- Comprehensive test suite (unit + integration)
+- Clear component ownership
+
+✅ **Developer Experience:**
+- Easy navigation and maintenance
+- CI/CD pipeline (automated testing + deployment)
+- Documentation auto-generated from code
+- Fast iteration cycle
+
+---
+
+### Next Steps
+
+**Immediate (This Week):**
+
+1. **Create Feature Branch**
+   ```bash
+   cd /home/federicodeponte/gtm-power-app-backend
+   git checkout -b feat/production-observability
+   ```
+
+2. **Implement Phase 1** (6-8 hours):
+   - [ ] Add `structlog` dependency to requirements
+   - [ ] Replace all `print()` statements with structured logging
+   - [ ] Add `slowapi` for rate limiting
+   - [ ] Implement rate limits on Gemini-using endpoints
+   - [ ] Add request ID generation and tracking
+   - [ ] Enhance `/health` endpoint with dependency checks
+
+3. **Test Locally**
+   ```bash
+   modal serve g-mcp-tools-complete.py
+   # Run integration tests
+   pytest test_execute_endpoint.py -v
+   # Manual smoke tests with curl
+   ```
+
+4. **Coordinate with Frontend Developer**
+   - Verify same endpoint behavior
+   - Confirm new request IDs are helpful
+   - Ensure rate limits don't block normal usage patterns
+   - Test enhanced health check integration
+
+5. **Deploy to Production**
+   ```bash
+   modal deploy g-mcp-tools-complete.py
+   # Verify deployment
+   curl https://scaile--g-mcp-tools-fast-api.modal.run/health
+   ```
+
+6. **Update Documentation**
+   - Update API_INTEGRATION_GUIDE.md with new observability features
+   - Document request ID usage for frontend
+   - Document rate limit thresholds
+
+**After Frontend MVP Stable (2-4 Weeks):**
+
+7. **Implement Phase 2** (18-24 hours):
+   - [ ] Reorganize code into modular structure
+   - [ ] Create centralized validation framework
+   - [ ] Set up GitHub Actions CI/CD pipeline
+   - [ ] Add comprehensive test suite
+
+8. **Performance Optimization** (if needed):
+   - Profile slow endpoints
+   - Optimize database queries
+   - Implement advanced caching strategies
+
+9. **Advanced Monitoring Setup**:
+   - Integrate with Datadog or New Relic
+   - Set up alerting rules
+   - Create monitoring dashboards
+
+---
+
 ## SaaS Business Model Viability
 
 ### ✅ Pricing Model Options

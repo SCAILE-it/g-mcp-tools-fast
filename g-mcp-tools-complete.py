@@ -7,12 +7,20 @@ import asyncio
 import re
 import time
 import secrets
+import uuid
+import logging
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 from enum import Enum
 
 import modal
 from pydantic import BaseModel, Field, validator
+
+# Conditional import to allow image building
+try:
+    import structlog
+except ImportError:
+    structlog = None  # Will be available after pip install during image build
 
 app = modal.App("g-mcp-tools-fast")
 image = (
@@ -28,14 +36,17 @@ image = (
         "pydantic>=2.0.0",
         "fastapi>=0.100.0",
         # Enrichment tools
-        "holehe>=1.61",  # Email intel
+        "holehe>=1.61",
         "phonenumbers>=8.13",
-        "email-validator>=2.1.0",  # Email validation
+        "email-validator>=2.1.0",
         "python-whois>=0.9",
         "requests>=2.31",
+        "httpx>=0.24.0",
         # Supabase integration
         "supabase>=2.0.0",
         "pyjwt>=2.8.0",
+        # Production observability
+        "structlog>=24.4.0",
     )
     .run_commands(
         # Playwright
@@ -46,6 +57,30 @@ image = (
         "cd /opt/theharvester && pip install .",
     )
 )
+
+
+# STRUCTURED LOGGING CONFIGURATION
+
+if structlog:
+    structlog.configure(
+        processors=[
+            structlog.contextvars.merge_contextvars,
+            structlog.processors.add_log_level,
+            structlog.processors.TimeStamper(fmt="iso", utc=True),
+            structlog.processors.StackInfoRenderer(),
+            structlog.processors.format_exc_info,
+            structlog.processors.JSONRenderer()
+        ],
+        wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),
+        context_class=dict,
+        logger_factory=structlog.PrintLoggerFactory(),
+        cache_logger_on_first_use=True,
+    )
+    logger = structlog.get_logger()
+else:
+    # Fallback to basic logging during image build
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
 
 
 # PYDANTIC MODELS
@@ -93,6 +128,12 @@ class ExecuteRequest(BaseModel):
     tool: str
     data: List[Dict[str, Any]]
     params: Dict[str, Any] = {}
+
+
+class WorkflowExecuteRequest(BaseModel):
+    """Request for /workflow/execute endpoint - JSON workflow execution with SSE streaming."""
+    workflow_id: str
+    inputs: Dict[str, Any]
 
 
 # CACHING & HELPERS
@@ -1409,6 +1450,744 @@ class Orchestrator:
         }
 
 
+# ============================================================================
+# PHASE 4: WORKFLOW SYSTEM - JSON-BASED AGENTS & TEMPLATES
+# ============================================================================
+
+
+class ToolRegistry:
+    """
+    Extensible tool registry supporting internal functions, HTTP webhooks, and MCP tools.
+    Loads tool definitions from database with caching for performance.
+    """
+
+    def __init__(self, internal_tools: Dict[str, Dict[str, Any]]):
+        """
+        Initialize ToolRegistry with internal TOOLS registry.
+
+        Args:
+            internal_tools: Existing TOOLS dict from Modal
+        """
+        self.internal_tools = internal_tools
+        self._cache = {}
+        self._cache_timestamp = {}
+        self._cache_ttl = 300  # 5 minutes
+
+    async def execute(
+        self,
+        tool_name: str,
+        params: Dict[str, Any],
+        user_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Execute tool by name (internal, HTTP, or MCP).
+
+        Args:
+            tool_name: Tool name from tool_definitions table
+            params: Tool parameters
+            user_id: User ID for HTTP tool authentication
+
+        Returns:
+            Dict: {success, tool_name, tool_type, data/error, execution_time_ms}
+        """
+        import time
+        start_time = time.time()
+
+        # Load tool definition from DB (with caching)
+        tool_def = await self._load_tool_definition(tool_name)
+
+        if not tool_def:
+            return {
+                "success": False,
+                "tool_name": tool_name,
+                "error": f"Tool '{tool_name}' not found in registry",
+                "error_type": "KeyError",
+                "execution_time_ms": (time.time() - start_time) * 1000
+            }
+
+        tool_type = tool_def["tool_type"]
+
+        try:
+            if tool_type == "internal":
+                result = await self._execute_internal(tool_def, params)
+            elif tool_type == "http":
+                result = await self._execute_http(tool_def, params, user_id)
+            elif tool_type == "mcp":
+                return {
+                    "success": False,
+                    "tool_name": tool_name,
+                    "tool_type": tool_type,
+                    "error": "MCP tools not implemented yet (V2 feature)",
+                    "error_type": "NotImplementedError",
+                    "execution_time_ms": (time.time() - start_time) * 1000
+                }
+            else:
+                return {
+                    "success": False,
+                    "tool_name": tool_name,
+                    "tool_type": tool_type,
+                    "error": f"Unknown tool type: {tool_type}",
+                    "error_type": "ValueError",
+                    "execution_time_ms": (time.time() - start_time) * 1000
+                }
+
+            execution_time = (time.time() - start_time) * 1000
+
+            return {
+                "success": result.get("success", True),
+                "tool_name": tool_name,
+                "tool_type": tool_type,
+                "data": result.get("data"),
+                "error": result.get("error"),
+                "execution_time_ms": execution_time
+            }
+
+        except Exception as e:
+            execution_time = (time.time() - start_time) * 1000
+            return {
+                "success": False,
+                "tool_name": tool_name,
+                "tool_type": tool_type,
+                "error": str(e),
+                "error_type": type(e).__name__,
+                "execution_time_ms": execution_time
+            }
+
+    async def _load_tool_definition(self, tool_name: str) -> Optional[Dict[str, Any]]:
+        """
+        Load tool definition from database with 5-minute caching.
+
+        Args:
+            tool_name: Tool name to load
+
+        Returns:
+            Tool definition dict or None if not found
+        """
+        import time
+        from supabase import create_client
+
+        # Check cache
+        if tool_name in self._cache:
+            age = time.time() - self._cache_timestamp.get(tool_name, 0)
+            if age < self._cache_ttl:
+                return self._cache[tool_name]
+
+        # Load from database
+        supabase_url = os.environ.get("SUPABASE_URL")
+        supabase_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+
+        if not supabase_url or not supabase_key:
+            # Supabase not configured - tool registry disabled
+            return None
+
+        try:
+            supabase = create_client(supabase_url, supabase_key)
+            response = supabase.table("tool_definitions")\
+                .select("*")\
+                .eq("tool_name", tool_name)\
+                .eq("is_active", True)\
+                .execute()
+
+            if response.data and len(response.data) > 0:
+                tool_def = response.data[0]
+                # Cache it
+                self._cache[tool_name] = tool_def
+                self._cache_timestamp[tool_name] = time.time()
+                return tool_def
+
+            return None
+
+        except Exception as e:
+            logger.warning("tool_definition_load_failed", tool_name=tool_name, error=str(e))
+            return None
+
+    async def _execute_internal(self, tool_def: Dict, params: Dict) -> Dict[str, Any]:
+        """
+        Execute internal tool via existing TOOLS registry.
+
+        Args:
+            tool_def: Tool definition from database
+            params: Tool parameters
+
+        Returns:
+            Dict: {success, data/error}
+        """
+        tool_name = tool_def["tool_name"]
+
+        # Check if tool exists in internal registry
+        if tool_name not in self.internal_tools:
+            return {
+                "success": False,
+                "error": f"Internal tool '{tool_name}' not found in TOOLS registry"
+            }
+
+        # Use existing ToolExecutor
+        executor = ToolExecutor(self.internal_tools)
+        result = await executor.execute(tool_name, params)
+
+        return {
+            "success": result["success"],
+            "data": result.get("data"),
+            "error": result.get("error")
+        }
+
+    async def _execute_http(
+        self,
+        tool_def: Dict,
+        params: Dict,
+        user_id: Optional[str]
+    ) -> Dict[str, Any]:
+        """
+        Execute HTTP webhook/API call with user authentication.
+
+        Args:
+            tool_def: Tool definition with HTTP config
+            params: Tool parameters
+            user_id: User ID for integration lookup
+
+        Returns:
+            Dict: {success, data/error}
+        """
+        import httpx
+        from supabase import create_client
+
+        config = tool_def["config"]
+        http_method = config.get("http_method", "POST")
+        http_url = config.get("http_url")
+        http_url_template = config.get("http_url_template")
+        requires_integration = config.get("requires_integration")
+
+        # Resolve URL template if needed
+        if http_url_template:
+            # Load user integration
+            if not user_id:
+                return {
+                    "success": False,
+                    "error": "HTTP tool requires authentication (user_id)"
+                }
+
+            # Get integration config
+            supabase_url = os.environ.get("SUPABASE_URL")
+            supabase_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+
+            if not supabase_url or not supabase_key:
+                return {
+                    "success": False,
+                    "error": "Supabase not configured for HTTP tools"
+                }
+
+            try:
+                supabase = create_client(supabase_url, supabase_key)
+                response = supabase.table("user_integrations")\
+                    .select("*")\
+                    .eq("user_id", user_id)\
+                    .eq("integration_name", requires_integration)\
+                    .eq("is_active", True)\
+                    .execute()
+
+                if not response.data or len(response.data) == 0:
+                    return {
+                        "success": False,
+                        "error": f"Integration '{requires_integration}' not configured for user"
+                    }
+
+                integration_config = response.data[0]["config"]
+
+                # Simple template substitution ({{user_integrations.X.Y}})
+                http_url = http_url_template.replace(
+                    f"{{{{user_integrations.{requires_integration}.webhook_url}}}}",
+                    integration_config.get("webhook_url", "")
+                )
+
+            except Exception as e:
+                return {
+                    "success": False,
+                    "error": f"Failed to load integration: {str(e)}"
+                }
+
+        # Execute HTTP request
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                if http_method.upper() == "POST":
+                    response = await client.post(http_url, json=params)
+                elif http_method.upper() == "GET":
+                    response = await client.get(http_url, params=params)
+                else:
+                    return {
+                        "success": False,
+                        "error": f"Unsupported HTTP method: {http_method}"
+                    }
+
+                response.raise_for_status()
+
+                return {
+                    "success": True,
+                    "data": response.json() if response.headers.get("content-type", "").startswith("application/json") else {"response": response.text}
+                }
+
+        except Exception as e:
+            return {
+                "success": False,
+                "error": f"HTTP request failed: {str(e)}"
+            }
+
+
+class WorkflowExecutor:
+    """
+    Executes JSON-based workflows with variable substitution and simple conditionals.
+    Supports SSE streaming for real-time progress updates.
+    """
+
+    def __init__(self, tool_registry: ToolRegistry):
+        """
+        Initialize WorkflowExecutor with tool registry.
+
+        Args:
+            tool_registry: ToolRegistry instance for dispatching tool calls
+        """
+        self.tool_registry = tool_registry
+
+    async def execute(
+        self,
+        workflow_id: str,
+        inputs: Dict[str, Any],
+        system_context: Dict[str, Any],
+        user_id: Optional[str] = None
+    ):
+        """
+        Execute workflow with SSE streaming.
+
+        Args:
+            workflow_id: Workflow template ID from database
+            inputs: User-provided input values
+            system_context: System context (date, country, etc.)
+            user_id: User ID for authentication and logging
+
+        Yields:
+            Dict: SSE events (step_start, step_complete, complete)
+        """
+        from supabase import create_client
+        import time
+
+        start_time = time.time()
+
+        # Load workflow template
+        workflow = await self._load_workflow(workflow_id)
+
+        if not workflow:
+            yield {
+                "event": "error",
+                "data": {
+                    "error": f"Workflow '{workflow_id}' not found",
+                    "error_type": "KeyError"
+                }
+            }
+            return
+
+        # Validate inputs
+        schema = workflow.get("json_schema", {})
+        required_inputs = schema.get("inputs", {})
+
+        for field, config in required_inputs.items():
+            if config.get("required", False) and field not in inputs:
+                yield {
+                    "event": "error",
+                    "data": {
+                        "error": f"Missing required input: {field}",
+                        "error_type": "ValueError"
+                    }
+                }
+                return
+
+        # Create workflow execution record
+        execution_id = await self._create_execution(workflow_id, inputs, user_id)
+
+        # Initialize variable context
+        context = {
+            "input": inputs,
+            "system": system_context,
+            "steps": {}
+        }
+
+        # Execute steps
+        steps = schema.get("steps", [])
+        total_steps = len(steps)
+        successful = 0
+        failed = 0
+
+        for i, step in enumerate(steps):
+            step_id = step["id"]
+            description = step.get("description", f"Step {i+1}")
+
+            # Evaluate condition if exists
+            condition = step.get("condition")
+            if condition:
+                if not self._evaluate_condition(condition, context):
+                    # Skip step
+                    continue
+
+            # Yield step_start event
+            yield {
+                "event": "step_start",
+                "data": {
+                    "step": i + 1,
+                    "step_id": step_id,
+                    "total_steps": total_steps,
+                    "description": description
+                }
+            }
+
+            # Resolve prompt template if specified
+            if "prompt_template" in step:
+                prompt_result = await self._resolve_prompt_template(
+                    step["prompt_template"],
+                    step.get("params", {}),
+                    context,
+                    user_id
+                )
+                if not prompt_result["success"]:
+                    context["steps"][step_id] = prompt_result
+                    failed += 1
+
+                    yield {
+                        "event": "step_complete",
+                        "data": {
+                            "step": i + 1,
+                            "step_id": step_id,
+                            "success": False,
+                            "error": prompt_result.get("error")
+                        }
+                    }
+                    continue
+
+                # Store prompt result
+                context["steps"][step_id] = prompt_result
+                successful += 1
+
+                yield {
+                    "event": "step_complete",
+                    "data": {
+                        "step": i + 1,
+                        "step_id": step_id,
+                        "success": True,
+                        "result": prompt_result.get("data")
+                    }
+                }
+                continue
+
+            # Execute tool
+            tool_name = step.get("tool")
+            if not tool_name:
+                error = "Step must specify either 'tool' or 'prompt_template'"
+                context["steps"][step_id] = {
+                    "success": False,
+                    "error": error
+                }
+                failed += 1
+
+                yield {
+                    "event": "step_complete",
+                    "data": {
+                        "step": i + 1,
+                        "step_id": step_id,
+                        "success": False,
+                        "error": error
+                    }
+                }
+                continue
+
+            # Substitute variables in params
+            params_template = step.get("params", {})
+            params = self._substitute_variables(params_template, context)
+
+            # Execute via ToolRegistry
+            result = await self.tool_registry.execute(tool_name, params, user_id)
+
+            # Store result in context
+            context["steps"][step_id] = result
+
+            if result["success"]:
+                successful += 1
+            else:
+                failed += 1
+
+            # Yield step_complete event
+            yield {
+                "event": "step_complete",
+                "data": {
+                    "step": i + 1,
+                    "step_id": step_id,
+                    "success": result["success"],
+                    "result": result.get("data") if result["success"] else None,
+                    "error": result.get("error") if not result["success"] else None,
+                    "execution_time_ms": result.get("execution_time_ms", 0)
+                }
+            }
+
+        # Resolve outputs
+        output_schema = schema.get("outputs", {})
+        outputs = {}
+        for key, template in output_schema.items():
+            outputs[key] = self._resolve_value(template, context)
+
+        # Update execution record
+        processing_ms = int((time.time() - start_time) * 1000)
+        await self._complete_execution(
+            execution_id,
+            outputs,
+            status="completed" if failed == 0 else "failed",
+            processing_ms=processing_ms
+        )
+
+        # Yield complete event
+        yield {
+            "event": "complete",
+            "data": {
+                "total_steps": total_steps,
+                "successful": successful,
+                "failed": failed,
+                "outputs": outputs,
+                "processing_time_ms": processing_ms
+            }
+        }
+
+    async def _load_workflow(self, workflow_id: str) -> Optional[Dict[str, Any]]:
+        """Load workflow template from database."""
+        from supabase import create_client
+
+        supabase_url = os.environ.get("SUPABASE_URL")
+        supabase_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+
+        if not supabase_url or not supabase_key:
+            return None
+
+        try:
+            supabase = create_client(supabase_url, supabase_key)
+            response = supabase.table("workflow_templates")\
+                .select("*")\
+                .eq("id", workflow_id)\
+                .execute()
+
+            if response.data and len(response.data) > 0:
+                return response.data[0]
+
+            return None
+
+        except Exception as e:
+            logger.warning("workflow_load_failed", error=str(e))
+            return None
+
+    async def _create_execution(
+        self,
+        template_id: str,
+        inputs: Dict[str, Any],
+        user_id: Optional[str]
+    ) -> str:
+        """Create workflow_executions record."""
+        from supabase import create_client
+
+        supabase_url = os.environ.get("SUPABASE_URL")
+        supabase_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+
+        if not supabase_url or not supabase_key:
+            return "unknown"
+
+        try:
+            supabase = create_client(supabase_url, supabase_key)
+            response = supabase.table("workflow_executions").insert({
+                "template_id": template_id,
+                "inputs": inputs,
+                "status": "running",
+                "started_at": datetime.now().isoformat()
+            }).execute()
+
+            if response.data and len(response.data) > 0:
+                return response.data[0]["id"]
+
+            return "unknown"
+
+        except Exception as e:
+            logger.warning("execution_record_create_failed", template_id=template_id, error=str(e))
+            return "unknown"
+
+    async def _complete_execution(
+        self,
+        execution_id: str,
+        outputs: Dict[str, Any],
+        status: str,
+        processing_ms: int
+    ):
+        """Update workflow_executions record with results."""
+        from supabase import create_client
+
+        supabase_url = os.environ.get("SUPABASE_URL")
+        supabase_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+
+        if not supabase_url or not supabase_key or execution_id == "unknown":
+            return
+
+        try:
+            supabase = create_client(supabase_url, supabase_key)
+            supabase.table("workflow_executions").update({
+                "outputs": outputs,
+                "status": status,
+                "completed_at": datetime.now().isoformat()
+            }).eq("id", execution_id).execute()
+
+        except Exception as e:
+            logger.warning("execution_record_update_failed", execution_id=execution_id, error=str(e))
+
+    async def _resolve_prompt_template(
+        self,
+        template_name: str,
+        params: Dict[str, Any],
+        context: Dict[str, Any],
+        user_id: Optional[str]
+    ) -> Dict[str, Any]:
+        """Resolve prompt template and substitute variables."""
+        from supabase import create_client
+
+        supabase_url = os.environ.get("SUPABASE_URL")
+        supabase_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+
+        if not supabase_url or not supabase_key:
+            return {
+                "success": False,
+                "error": "Supabase not configured"
+            }
+
+        try:
+            supabase = create_client(supabase_url, supabase_key)
+
+            # Load prompt template
+            response = supabase.table("prompt_templates")\
+                .select("*")\
+                .eq("name", template_name)\
+                .or_(f"is_system.eq.true,user_id.eq.{user_id}")\
+                .execute()
+
+            if not response.data or len(response.data) == 0:
+                return {
+                    "success": False,
+                    "error": f"Prompt template '{template_name}' not found"
+                }
+
+            template_text = response.data[0]["template_text"]
+
+            # Substitute variables in params first
+            resolved_params = self._substitute_variables(params, context)
+
+            # Substitute variables in template
+            final_prompt = template_text
+            for key, value in resolved_params.items():
+                final_prompt = final_prompt.replace(f"{{{{{key}}}}}", str(value))
+
+            return {
+                "success": True,
+                "data": {"prompt": final_prompt}
+            }
+
+        except Exception as e:
+            return {
+                "success": False,
+                "error": f"Failed to resolve prompt template: {str(e)}"
+            }
+
+    def _substitute_variables(
+        self,
+        template: Any,
+        context: Dict[str, Any]
+    ) -> Any:
+        """
+        Recursively substitute {{variable}} placeholders with context values.
+
+        Args:
+            template: String, dict, list, or primitive value with {{variables}}
+            context: Variable context (input, system, steps)
+
+        Returns:
+            Resolved value with variables substituted
+        """
+        if isinstance(template, str):
+            # Handle {{variable}} syntax
+            if template.startswith("{{") and template.endswith("}}"):
+                path = template[2:-2].strip()
+                return self._resolve_value(template, context)
+
+            # Handle strings with multiple {{variables}}
+            result = template
+            import re
+            for match in re.findall(r'\{\{([^}]+)\}\}', template):
+                value = self._resolve_path(match.strip(), context)
+                result = result.replace(f"{{{{{match}}}}}", str(value) if value is not None else "")
+            return result
+
+        elif isinstance(template, dict):
+            return {k: self._substitute_variables(v, context) for k, v in template.items()}
+
+        elif isinstance(template, list):
+            return [self._substitute_variables(item, context) for item in template]
+
+        else:
+            return template
+
+    def _resolve_value(self, template: str, context: Dict[str, Any]) -> Any:
+        """Resolve single {{variable}} to its value."""
+        if not (template.startswith("{{") and template.endswith("}}")):
+            return template
+
+        path = template[2:-2].strip()
+        return self._resolve_path(path, context)
+
+    def _resolve_path(self, path: str, context: Dict[str, Any]) -> Any:
+        """
+        Resolve dot-notation path in context.
+
+        Examples:
+            input.email → context["input"]["email"]
+            steps.validate.data.valid → context["steps"]["validate"]["data"]["valid"]
+            system.date → context["system"]["date"]
+        """
+        parts = path.split(".")
+        value = context
+
+        for part in parts:
+            if isinstance(value, dict):
+                value = value.get(part)
+            else:
+                return None
+
+            if value is None:
+                return None
+
+        return value
+
+    def _evaluate_condition(self, condition: str, context: Dict[str, Any]) -> bool:
+        """Evaluate simple boolean condition (V1 - path evaluation only)."""
+        return bool(self._resolve_value(condition, context))
+
+
+def get_system_context(request: Any) -> Dict[str, Any]:
+    """
+    Extract system context from request headers.
+
+    Args:
+        request: FastAPI Request object
+
+    Returns:
+        Dict: {date, country, timezone, language}
+    """
+    from datetime import datetime
+
+    return {
+        "date": datetime.now().isoformat()[:10],  # YYYY-MM-DD
+        "datetime": datetime.now().isoformat(),
+        "country": request.headers.get("cf-ipcountry", "US"),
+        "timezone": request.headers.get("timezone", "UTC"),
+        "language": request.headers.get("accept-language", "en")[:2] if request.headers.get("accept-language") else "en"
+    }
+
+
 def extract_citations_from_grounding(response: Any, max_results: int = 10) -> List[Dict[str, str]]:
     """
     Extract citations from Gemini response.
@@ -2136,7 +2915,7 @@ def log_api_call(
         }).execute()
     except Exception as e:
         # Logging failures should not break the API
-        print(f"⚠️  API call logging failed: {e}")
+        logger.warning("api_call_logging_failed", tool_name=tool_name, tool_type=tool_type, error=str(e))
 
 
 def check_quota(user_id: str) -> None:
@@ -2193,7 +2972,7 @@ def check_quota(user_id: str) -> None:
         raise
     except Exception as e:
         # Log unexpected errors but don't block request
-        print(f"⚠️  Quota check failed: {e}")
+        logger.warning("quota_check_failed", user_id=user_id, error=str(e))
         # Allow request to proceed if quota check fails
 
 
@@ -2321,7 +3100,7 @@ def fire_webhook(webhook_url: str, payload: Dict[str, Any]) -> bool:
         response.raise_for_status()
         return True
     except Exception as e:
-        print(f"Webhook failed for batch {payload.get('batch_id')}: {e}")
+        logger.warning("webhook_failed", batch_id=payload.get('batch_id'), error=str(e))
         return False
 
 
@@ -2562,7 +3341,7 @@ async def run_scheduled_jobs():
         supabase_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
 
         if not supabase_url or not supabase_key:
-            print("❌ Scheduled worker: Supabase not configured")
+            logger.error("scheduled_worker_supabase_not_configured")
             return
 
         supabase = create_client(supabase_url, supabase_key)
@@ -2576,11 +3355,11 @@ async def run_scheduled_jobs():
             .execute()
 
         if not result.data:
-            print(f"✅ Scheduled worker: No jobs due at {now.isoformat()}")
+            logger.info("scheduled_worker_no_jobs_due", timestamp=now.isoformat())
             return
 
         jobs = result.data
-        print(f"🚀 Scheduled worker: Found {len(jobs)} jobs to execute")
+        logger.info("scheduled_worker_jobs_found", count=len(jobs))
 
         # Execute each job
         for job in jobs:
@@ -2590,7 +3369,7 @@ async def run_scheduled_jobs():
             params = job["params"]
             schedule_preset = job.get("schedule_preset")
 
-            print(f"  ⏰ Executing job {job_id}: {job['name']} (tool: {tool_name})")
+            logger.info("scheduled_job_executing", job_id=job_id, job_name=job['name'], tool=tool_name)
 
             start_time = time.time()
             success = False
@@ -2604,7 +3383,7 @@ async def run_scheduled_jobs():
                     rows = params["rows"]
                     tools = params.get("tools")  # Optional explicit tools
 
-                    print(f"    📦 Bulk job: {len(rows)} rows")
+                    logger.info("bulk_job_detected", job_id=job_id, row_count=len(rows))
 
                     if tools:
                         # Explicit tools specified
@@ -2630,7 +3409,7 @@ async def run_scheduled_jobs():
                     if not success:
                         error_msg = f"Batch processing failed: {result.get('status')}"
 
-                    print(f"    ✅ Bulk job {job_id}: {result.get('successful', 0)}/{result.get('total_rows', 0)} rows succeeded")
+                    logger.info("bulk_job_completed", job_id=job_id, successful=result.get('successful', 0), total_rows=result.get('total_rows', 0))
 
                 else:
                     # SINGLE TOOL JOB - Execute one tool
@@ -2643,17 +3422,17 @@ async def run_scheduled_jobs():
                     # Execute tool
                     result = await tool_fn(**params)
                     success = True
-                    print(f"    ✅ Job {job_id} succeeded")
+                    logger.info("scheduled_job_succeeded", job_id=job_id)
 
             except Exception as e:
                 error_msg = str(e)
-                print(f"    ❌ Job {job_id} failed: {error_msg}")
+                logger.error("scheduled_job_failed", job_id=job_id, error=error_msg)
 
             # Calculate next run time
             try:
                 next_run = calculate_next_run_at(schedule_preset, from_time=now)
             except Exception as e:
-                print(f"    ⚠️  Failed to calculate next run: {e}")
+                logger.warning("next_run_calculation_failed", job_id=job_id, error=str(e))
                 next_run = now  # Fallback to now (won't run again until manually updated)
 
             # Update job
@@ -2701,12 +3480,12 @@ async def run_scheduled_jobs():
                     error_message=error_msg
                 )
             except Exception as e:
-                print(f"    ⚠️  Failed to log API call: {e}")
+                logger.warning("scheduled_job_logging_failed", job_id=job_id, error=str(e))
 
-        print(f"✅ Scheduled worker: Completed {len(jobs)} jobs")
+        logger.info("scheduled_worker_completed", jobs_processed=len(jobs))
 
     except Exception as e:
-        print(f"❌ Scheduled worker critical error: {str(e)}")
+        logger.error("scheduled_worker_critical_error", error=str(e))
 
 
 # TOOL REGISTRY - Hierarchical organization by tool type (module-level for access from workers)
@@ -2759,6 +3538,61 @@ def api():
         docs_url="/docs",
         redoc_url="/redoc",
     )
+
+    # Supabase-based distributed rate limiting
+    async def check_rate_limit(user_id: Optional[str], endpoint: str, limit_per_minute: int) -> bool:
+        """
+        Check if user/endpoint has exceeded rate limit using Supabase.
+        Returns True if allowed, False if rate limited.
+        """
+        try:
+            from supabase import create_client
+            supabase_url = os.environ.get("SUPABASE_URL")
+            supabase_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+
+            if not supabase_url or not supabase_key:
+                logger.warning("rate_limit_check_skipped", reason="Supabase not configured")
+                return True  # Allow if DB not configured
+
+            supabase = create_client(supabase_url, supabase_key)
+            # Use fixed UUID for anonymous users (Supabase user_id column is UUID type)
+            key = user_id if user_id else "00000000-0000-0000-0000-000000000000"
+            now = datetime.now()
+            window_start = now - timedelta(minutes=1)
+
+            # Count requests in the last minute
+            result = supabase.table("api_calls").select("id", count="exact").eq(
+                "user_id", key
+            ).eq("tool_name", endpoint).gte(
+                "created_at", window_start.isoformat()
+            ).execute()
+
+            count = result.count if hasattr(result, 'count') else 0
+
+            if count >= limit_per_minute:
+                logger.warning(
+                    "rate_limit_exceeded",
+                    user_id=key,
+                    endpoint=endpoint,
+                    count=count,
+                    limit=limit_per_minute
+                )
+                return False
+
+            return True
+
+        except Exception as e:
+            logger.error("rate_limit_check_failed", error=str(e))
+            return True  # Fail open (allow request if rate limit check fails)
+
+    # Request ID middleware
+    @web_app.middleware("http")
+    async def add_request_id(request: Request, call_next):
+        request_id = str(uuid.uuid4())
+        with structlog.contextvars.bound_contextvars(request_id=request_id):
+            response = await call_next(request)
+            response.headers["X-Request-ID"] = request_id
+            return response
 
     # Custom OpenAPI schema
     def custom_openapi():
@@ -2891,22 +3725,114 @@ def api():
         handler.__name__ = f"{tool_name.replace('-', '_')}_route"
         return handler
 
+    # DEPENDENCY HEALTH CHECKS
+
+    async def test_gemini_connection() -> Dict[str, Any]:
+        """Test Gemini API connectivity with minimal request."""
+        try:
+            import google.generativeai as genai
+            api_key = os.environ.get("GEMINI_API_KEY")
+
+            if not api_key:
+                return {"status": "unconfigured", "error": "GEMINI_API_KEY not set"}
+
+            genai.configure(api_key=api_key)
+            model = genai.GenerativeModel("gemini-2.0-flash-exp")
+
+            # Minimal test request with 1-second timeout
+            response = await asyncio.wait_for(
+                asyncio.to_thread(model.generate_content, "test"),
+                timeout=2.0
+            )
+
+            return {"status": "healthy", "model": "gemini-2.0-flash-exp"}
+        except asyncio.TimeoutError:
+            return {"status": "timeout", "error": "Request timed out after 2s"}
+        except Exception as e:
+            return {"status": "unavailable", "error": str(e)[:100]}
+
+    async def test_supabase_connection() -> Dict[str, Any]:
+        """Test Supabase connectivity with minimal query."""
+        try:
+            from supabase import create_client
+            url = os.environ.get("SUPABASE_URL")
+            key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+
+            if not url or not key:
+                return {"status": "unconfigured", "error": "Supabase credentials not set"}
+
+            # Test connection with simple query
+            supabase = create_client(url, key)
+            result = await asyncio.wait_for(
+                asyncio.to_thread(lambda: supabase.table("api_calls").select("id").limit(1).execute()),
+                timeout=2.0
+            )
+
+            return {"status": "healthy", "database": "connected"}
+        except asyncio.TimeoutError:
+            return {"status": "timeout", "error": "Request timed out after 2s"}
+        except Exception as e:
+            return {"status": "unavailable", "error": str(e)[:100]}
+
     # EXPLICIT ENDPOINTS
     @web_app.get("/health", tags=["System"])
     async def health_check():
-        """Health check endpoint for monitoring and uptime checks."""
+        """Enhanced health check endpoint with dependency testing."""
         categories = list({config["type"] for config in TOOLS.values()})
+
+        # Test dependencies in parallel
+        gemini_health, supabase_health = await asyncio.gather(
+            test_gemini_connection(),
+            test_supabase_connection(),
+            return_exceptions=True
+        )
+
+        # Handle exceptions from gather
+        if isinstance(gemini_health, Exception):
+            gemini_health = {"status": "error", "error": str(gemini_health)}
+        if isinstance(supabase_health, Exception):
+            supabase_health = {"status": "error", "error": str(supabase_health)}
+
+        # Determine overall status
+        all_healthy = (
+            gemini_health.get("status") == "healthy" and
+            supabase_health.get("status") == "healthy"
+        )
+        overall_status = "healthy" if all_healthy else "degraded"
+
         return {
-            "status": "healthy",
+            "status": overall_status,
             "service": "g-mcp-tools-fast",
             "version": "1.0.0",
             "tools": len(TOOLS),
-            "categories": categories,  # ["enrichment", "generation", "analysis"]
+            "categories": categories,
+            "dependencies": {
+                "gemini": gemini_health,
+                "supabase": supabase_health
+            },
             "timestamp": datetime.now().isoformat() + "Z",
+        }
+
+    @web_app.get("/debug/headers", tags=["System"])
+    async def debug_headers(request: Request):
+        """Debug endpoint to inspect request headers for rate limiting."""
+        headers = dict(request.headers)
+        client = request.client
+        return {
+            "headers": headers,
+            "client_host": client.host if client else None,
+            "client_port": client.port if client else None,
+            "real_ip_candidates": {
+                "x-forwarded-for": headers.get("x-forwarded-for"),
+                "x-real-ip": headers.get("x-real-ip"),
+                "cf-connecting-ip": headers.get("cf-connecting-ip"),
+                "true-client-ip": headers.get("true-client-ip"),
+            }
         }
 
     @web_app.post("/plan", tags=["AI Orchestration"])
     async def plan_route(
+        request: Request,
         request_data: Dict[str, Any] = Body(...),
         user_id: Optional[str] = Depends(get_current_user)
     ):
@@ -2922,6 +3848,18 @@ def api():
             - **plan**: List of step descriptions
             - **total_steps**: Number of steps in plan
         """
+        # Rate limiting check
+        if not await check_rate_limit(user_id, "/plan", 10):
+            return JSONResponse(
+                status_code=429,
+                content={
+                    "success": False,
+                    "error": "Rate limit exceeded. Maximum 10 requests per minute.",
+                    "retry_after": 60
+                }
+            )
+
+        start_time = time.time()
         try:
             user_request = request_data.get("user_request")
             if not user_request:
@@ -2936,6 +3874,18 @@ def api():
             # Generate plan
             plan = planner.generate(user_request)
 
+            # Log successful API call
+            processing_ms = int((time.time() - start_time) * 1000)
+            log_api_call(
+                user_id=user_id or "00000000-0000-0000-0000-000000000000",
+                tool_name="/plan",
+                tool_type="orchestration",
+                input_data={"user_request": user_request},
+                output_data={"plan": plan, "total_steps": len(plan)},
+                success=True,
+                processing_ms=processing_ms
+            )
+
             return {
                 "success": True,
                 "plan": plan,
@@ -2946,6 +3896,19 @@ def api():
                 }
             }
         except Exception as e:
+            # Log failed API call
+            processing_ms = int((time.time() - start_time) * 1000)
+            log_api_call(
+                user_id=user_id or "00000000-0000-0000-0000-000000000000",
+                tool_name="/plan",
+                tool_type="orchestration",
+                input_data=request_data,
+                output_data={},
+                success=False,
+                error_message=str(e),
+                processing_ms=processing_ms
+            )
+
             return JSONResponse(
                 status_code=500,
                 content={"success": False, "error": str(e)}
@@ -2953,6 +3916,7 @@ def api():
 
     @web_app.post("/execute", tags=["Tool Execution"])
     async def execute_route(
+        request: Request,
         request_data: ExecuteRequest,
         user_id: Optional[str] = Depends(get_current_user)
     ):
@@ -2969,6 +3933,17 @@ def api():
         - **progress**: Row-level progress updates
         - **result**: Final results with summary
         """
+        # Rate limiting check
+        if not await check_rate_limit(user_id, "/execute", 20):
+            return JSONResponse(
+                status_code=429,
+                content={
+                    "success": False,
+                    "error": "Rate limit exceeded. Maximum 20 requests per minute.",
+                    "retry_after": 60
+                }
+            )
+
         try:
             # Quota enforcement for authenticated users
             if user_id:
@@ -3054,6 +4029,7 @@ def api():
 
     @web_app.post("/orchestrate", tags=["AI Orchestration"])
     async def orchestrate_route(
+        request: Request,
         request_data: Dict[str, Any] = Body(...),
         user_id: Optional[str] = Depends(get_current_user)
     ):
@@ -3075,6 +4051,17 @@ def api():
             StreamingResponse with SSE events (if stream=true)
             OR blocking JSON response (if stream=false)
         """
+        # Rate limiting check
+        if not await check_rate_limit(user_id, "/orchestrate", 10):
+            return JSONResponse(
+                status_code=429,
+                content={
+                    "success": False,
+                    "error": "Rate limit exceeded. Maximum 10 requests per minute.",
+                    "retry_after": 60
+                }
+            )
+
         try:
             user_request = request_data.get("user_request")
             stream_mode = request_data.get("stream", True)
@@ -3160,6 +4147,366 @@ def api():
                     )
 
                 return result
+
+        except Exception as e:
+            return JSONResponse(
+                status_code=500,
+                content={"success": False, "error": str(e)}
+            )
+
+    @web_app.post("/workflow/execute", tags=["Workflows"])
+    async def workflow_execute_route(
+        request: Request,
+        request_data: WorkflowExecuteRequest,
+        user_id: Optional[str] = Depends(get_current_user)
+    ):
+        """
+        Execute JSON-based workflow with SSE streaming.
+
+        - **workflow_id**: Workflow template UUID from workflow_templates table
+        - **inputs**: User-provided input values matching workflow schema
+
+        SSE Events:
+        - **step_start**: Step execution started
+        - **step_complete**: Step execution completed (with result or error)
+        - **complete**: All steps finished
+        - **error**: Workflow execution error
+
+        Returns:
+            StreamingResponse with SSE events
+        """
+        # Rate limiting check
+        if not await check_rate_limit(user_id, "/workflow/execute", 10):
+            return JSONResponse(
+                status_code=429,
+                content={
+                    "success": False,
+                    "error": "Rate limit exceeded. Maximum 10 requests per minute.",
+                    "retry_after": 60
+                }
+            )
+
+        try:
+            # Get system context from request headers
+            system_context = get_system_context(request)
+
+            # Initialize workflow executor
+            tool_registry = ToolRegistry(TOOLS)
+            workflow_executor = WorkflowExecutor(tool_registry)
+
+            # SSE streaming
+            async def event_generator():
+                final_result = None
+                start_time = time.time()
+
+                try:
+                    async for event in workflow_executor.execute(
+                        workflow_id=request_data.workflow_id,
+                        inputs=request_data.inputs,
+                        system_context=system_context,
+                        user_id=user_id
+                    ):
+                        event_type = event.get("event", "message")
+                        event_data = event.get("data", {})
+
+                        # Track final result for logging
+                        if event_type == "complete":
+                            final_result = event_data
+
+                        # Merge type into data for frontend compatibility
+                        event_data_with_type = {"type": event_type, **event_data}
+                        sse_message = f"data: {json.dumps(event_data_with_type)}\n\n"
+                        yield sse_message
+
+                except Exception as e:
+                    error_data = {"type": "error", "error": str(e)}
+                    error_event = f"data: {json.dumps(error_data)}\n\n"
+                    yield error_event
+                    final_result = {"error": str(e), "successful": 0, "failed": 1}
+
+                finally:
+                    # Log to api_calls table
+                    if user_id and final_result:
+                        processing_ms = int((time.time() - start_time) * 1000)
+
+                        log_api_call(
+                            user_id=user_id,
+                            tool_name=f"workflow:{request_data.workflow_id}",
+                            tool_type="workflow",
+                            input_data={"inputs": request_data.inputs},
+                            output_data=final_result,
+                            success=final_result.get("failed", 0) == 0,
+                            processing_ms=processing_ms,
+                            error_message=final_result.get("error")
+                        )
+
+            return StreamingResponse(
+                event_generator(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "X-Accel-Buffering": "no",
+                    "Connection": "keep-alive"
+                }
+            )
+
+        except Exception as e:
+            return JSONResponse(
+                status_code=500,
+                content={"success": False, "error": str(e)}
+            )
+
+    @web_app.post("/workflow/generate", tags=["Workflows"])
+    async def workflow_generate_route(
+        request_data: Dict[str, Any],
+        user_id: Optional[str] = Depends(get_current_user)
+    ):
+        """
+        Generate workflow JSON from natural language using AI.
+
+        - **user_request**: Natural language description of workflow
+        - **save_as**: Optional workflow name to save after generation
+
+        Returns:
+            Generated workflow JSON with validation
+        """
+        try:
+            user_request = request_data.get("user_request")
+            save_as = request_data.get("save_as")
+
+            if not user_request:
+                return JSONResponse(
+                    status_code=400,
+                    content={"success": False, "error": "Missing required field: user_request"}
+                )
+
+            # Load system documentation from database
+            from supabase import create_client
+
+            supabase_url = os.environ.get("SUPABASE_URL")
+            supabase_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+
+            if not supabase_url or not supabase_key:
+                return JSONResponse(
+                    status_code=500,
+                    content={"success": False, "error": "Supabase not configured"}
+                )
+
+            supabase = create_client(supabase_url, supabase_key)
+
+            # Fetch documentation
+            docs_response = supabase.table("system_documentation")\
+                .select("*")\
+                .execute()
+
+            docs_content = "\n\n".join([
+                f"# {doc['title']}\n\n{doc['content']}"
+                for doc in docs_response.data
+            ]) if docs_response.data else ""
+
+            # Fetch available tools
+            tools_response = supabase.table("tool_definitions")\
+                .select("tool_name, display_name, description, tool_type")\
+                .eq("is_active", True)\
+                .execute()
+
+            tools_list = "\n".join([
+                f"- **{tool['tool_name']}** ({tool['tool_type']}): {tool['description']}"
+                for tool in tools_response.data
+            ]) if tools_response.data else ""
+
+            # Build system prompt for Gemini
+            system_prompt = f"""You are a workflow generator AI. Generate valid JSON workflows from natural language descriptions.
+
+# System Documentation
+
+{docs_content}
+
+# Available Tools
+
+{tools_list}
+
+# Task
+
+Generate a valid JSON workflow for this request:
+{user_request}
+
+Return ONLY the JSON workflow object, no markdown code blocks or explanations."""
+
+            # Call Gemini
+            from google import generativeai as genai
+
+            gemini_api_key = os.environ.get("GEMINI_API_KEY")
+            if not gemini_api_key:
+                return JSONResponse(
+                    status_code=500,
+                    content={"success": False, "error": "Gemini API key not configured"}
+                )
+
+            genai.configure(api_key=gemini_api_key)
+            model = genai.GenerativeModel('gemini-2.0-flash-exp')
+
+            response = model.generate_content(system_prompt)
+            workflow_json_str = response.text.strip()
+
+            # Remove markdown code blocks if present
+            if workflow_json_str.startswith("```"):
+                workflow_json_str = workflow_json_str.split("```")[1]
+                if workflow_json_str.startswith("json"):
+                    workflow_json_str = workflow_json_str[4:]
+                workflow_json_str = workflow_json_str.strip()
+
+            # Parse and validate JSON
+            try:
+                workflow_json = json.loads(workflow_json_str)
+            except json.JSONDecodeError as e:
+                return {
+                    "success": False,
+                    "error": f"Generated invalid JSON: {str(e)}",
+                    "raw_output": workflow_json_str
+                }
+
+            # Validate schema structure
+            if "steps" not in workflow_json:
+                return {
+                    "success": False,
+                    "error": "Generated workflow missing 'steps' array"
+                }
+
+            # Save if requested
+            saved_id = None
+            if save_as and user_id:
+                try:
+                    save_response = supabase.table("workflow_templates").insert({
+                        "name": save_as,
+                        "description": f"AI-generated from: {user_request[:100]}",
+                        "json_schema": workflow_json,
+                        "scope": "global",
+                        "is_system": False,
+                        "created_by": user_id
+                    }).execute()
+
+                    if save_response.data and len(save_response.data) > 0:
+                        saved_id = save_response.data[0]["id"]
+
+                except Exception as e:
+                    # Saving failed but generation succeeded
+                    logger.warning("workflow_save_failed", error=str(e))
+
+            return {
+                "success": True,
+                "workflow": workflow_json,
+                "saved_id": saved_id,
+                "metadata": {
+                    "user_request": user_request,
+                    "generated_at": datetime.now().isoformat() + "Z"
+                }
+            }
+
+        except Exception as e:
+            return JSONResponse(
+                status_code=500,
+                content={"success": False, "error": str(e)}
+            )
+
+    @web_app.get("/tools", tags=["Workflows"])
+    async def tools_list_route(user_id: Optional[str] = Depends(get_current_user)):
+        """
+        List all available tools from tool_definitions table.
+
+        Returns:
+            List of tools with metadata (name, type, description, category)
+        """
+        try:
+            from supabase import create_client
+
+            supabase_url = os.environ.get("SUPABASE_URL")
+            supabase_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+
+            if not supabase_url or not supabase_key:
+                return JSONResponse(
+                    status_code=500,
+                    content={"success": False, "error": "Supabase not configured"}
+                )
+
+            supabase = create_client(supabase_url, supabase_key)
+
+            # Fetch all active tools
+            response = supabase.table("tool_definitions")\
+                .select("tool_name, tool_type, category, display_name, description")\
+                .eq("is_active", True)\
+                .execute()
+
+            if not response.data:
+                return {
+                    "success": True,
+                    "tools": [],
+                    "total": 0
+                }
+
+            # Group by category
+            by_category = {}
+            for tool in response.data:
+                category = tool["category"]
+                if category not in by_category:
+                    by_category[category] = []
+                by_category[category].append({
+                    "name": tool["tool_name"],
+                    "type": tool["tool_type"],
+                    "display_name": tool["display_name"],
+                    "description": tool["description"]
+                })
+
+            return {
+                "success": True,
+                "tools": response.data,
+                "by_category": by_category,
+                "total": len(response.data)
+            }
+
+        except Exception as e:
+            return JSONResponse(
+                status_code=500,
+                content={"success": False, "error": str(e)}
+            )
+
+    @web_app.get("/workflow/documentation", tags=["Workflows"])
+    async def workflow_documentation_route():
+        """
+        Get system documentation for workflow JSON schema, variable syntax, and examples.
+
+        Returns:
+            Documentation entries for developers and AI workflow generators
+        """
+        try:
+            from supabase import create_client
+
+            supabase_url = os.environ.get("SUPABASE_URL")
+            supabase_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+
+            if not supabase_url or not supabase_key:
+                return JSONResponse(
+                    status_code=500,
+                    content={"success": False, "error": "Supabase not configured"}
+                )
+
+            supabase = create_client(supabase_url, supabase_key)
+
+            # Fetch all documentation
+            response = supabase.table("system_documentation")\
+                .select("*")\
+                .execute()
+
+            if not response.data:
+                return {
+                    "success": True,
+                    "documentation": []
+                }
+
+            return {
+                "success": True,
+                "documentation": response.data
+            }
 
         except Exception as e:
             return JSONResponse(
