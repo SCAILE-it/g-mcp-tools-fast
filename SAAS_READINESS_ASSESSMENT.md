@@ -357,140 +357,150 @@ All critical infrastructure, security, documentation, and quality requirements h
 - ✅ HTTPS enforced, secrets managed via Modal
 - ✅ Pydantic input validation on all endpoints
 
-**What's Missing (Production-Critical):**
-- ❌ **Structured logging** - Currently uses `print()` statements
-- ❌ **Rate limiting** - Gemini API has 10 requests/minute limit
-- ❌ **Request ID tracing** - Cannot correlate logs across distributed system
-- ❌ **Enhanced health checks** - No dependency connectivity tests
-- ⏳ **Code organization** - 5,193 LOC monolith (defer until frontend MVP stable)
+**✅ Phase 1 Observability: COMPLETE (as of 2025-10-29)**
+
+**Production-Critical Features:**
+- ✅ **Structured logging** - Implemented with structlog (23 logger instances, JSON output)
+- ✅ **Rate limiting** - Supabase-based distributed limiting (works for sequential, see RATE_LIMITING_STATUS.md)
+- ✅ **Request ID tracing** - UUID generation + X-Request-ID header + contextvars binding
+- ✅ **Enhanced health checks** - Gemini + Supabase connectivity tests with timeout handling
+- ⏳ **Code organization** - 5,446 LOC monolith (defer until frontend MVP stable)
 - ⏳ **Input validation framework** - Ad-hoc validation (works but not centralized)
 - ⏳ **CI/CD pipeline** - Manual `modal deploy` only
 
 ---
 
-### Phase 1: DO NOW (Before Frontend MVP Complete)
+### Phase 1: ✅ COMPLETE (Implemented 2025-10-29)
 
-**Timeline:** 1 day (6-8 hours)
+**Original Timeline:** 1 day (6-8 hours) → **Actual: Complete**
 **Risk Level:** LOW - No API surface changes, fully backward compatible
 **Frontend Impact:** ZERO (same endpoints, same responses, better observability)
 
-#### 1. Structured Logging (2-3 hours)
+**Status:** All Phase 1 items have been implemented and tested. See test results below.
 
-**Why NOW:** Essential for debugging frontend integration issues and production troubleshooting.
+#### 1. Structured Logging ✅ IMPLEMENTED
 
-**Current Problem:**
-```python
-# Line 2884: Print-based logging (not production-grade)
-print(f"⚠️  API call logging failed: {e}")
-```
+**Implementation Status:** COMPLETE
 
-**Implementation:**
+**What was done:**
+- ✅ Added structlog>=24.4.0 to requirements (line 49)
+- ✅ Configured JSON-formatted logging with timestamp, log level, context (lines 64-83)
+- ✅ 23 logger instances throughout codebase
+- ✅ Zero `print()` statements remaining
+- ✅ Context includes: request_id, user_id, tool_name, execution_id, error details
+
+**Current Implementation:**
 ```python
 import structlog
 
+# Configuration (lines 64-83)
+structlog.configure(
+    processors=[
+        structlog.contextvars.merge_contextvars,
+        structlog.processors.add_log_level,
+        structlog.processors.TimeStamper(fmt="iso", utc=True),
+        structlog.processors.StackInfoRenderer(),
+        structlog.processors.format_exc_info,
+        structlog.processors.JSONRenderer()
+    ],
+    wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),
+    logger_factory=structlog.PrintLoggerFactory(),
+)
+
 logger = structlog.get_logger()
 
-# Replace all print() statements with structured logs
-logger.info("processing_rows",
-    row_count=row_count,
-    execution_id=execution_id,
-    request_id=request_id,
-    user_id=user_id)
-
-logger.error("api_call_logging_failed",
-    error=str(e),
-    request_id=request_id,
-    execution_id=execution_id)
+# Usage examples:
+logger.warning("tool_definition_load_failed", tool_name=tool_name, error=str(e))
+logger.error("scheduled_job_failed", job_id=job_id, error=error_msg)
+logger.info("bulk_job_completed", job_id=job_id, successful=result.get('successful'))
 ```
 
-**Benefits:**
+**Benefits Achieved:**
 - ✅ Logs aggregatable in monitoring tools (Datadog, New Relic)
 - ✅ Searchable by execution_id, user_id, request_id
 - ✅ Machine-readable JSON format for alerting
 - ✅ Frontend can reference request_id in bug reports
 - ✅ Trace requests across tool executions
 
-**Migration Strategy:** Additive only - existing functionality unchanged
-
 ---
 
-#### 2. Rate Limiting (3-4 hours)
+#### 2. Rate Limiting ✅ IMPLEMENTED (with known limitation)
 
-**Why NOW:** Protects Gemini API quota (10 req/min) and prevents abuse/DDoS attacks.
+**Implementation Status:** COMPLETE (Supabase-based)
 
-**Current Problem:**
+**What was done:**
+- ✅ Supabase-based distributed rate limiting (works across Modal containers)
+- ✅ Database-backed request counting (last 60 seconds window)
+- ✅ Anonymous user support via fixed UUID
+- ✅ Applied to: `/plan` (10/min), `/execute` (20/min), `/orchestrate` (10/min), `/workflow/execute` (10/min)
+- ⚠️ **Known Limitation:** Race condition on concurrent bursts (see RATE_LIMITING_STATUS.md)
+
+**Actual Implementation:**
 ```python
-# Line 834: Rate limit enum defined but NOT ENFORCED
-RATE_LIMIT = "rate_limit"
-```
+async def check_rate_limit(user_id: Optional[str], endpoint: str, limit_per_minute: int) -> bool:
+    """Query Supabase for requests in last 60 seconds."""
+    window_start = now - timedelta(minutes=1)
+    result = supabase.table("api_calls").select("id", count="exact").eq(
+        "user_id", key
+    ).eq("tool_name", endpoint).gte(
+        "created_at", window_start.isoformat()
+    ).execute()
 
-**Implementation:**
-```python
-from slowapi import Limiter
-from slowapi.util import get_remote_address
-
-limiter = Limiter(key_func=get_remote_address)
-
-@web_app.post("/orchestrate")
-@limiter.limit("10/minute")  # Matches Gemini API limit
-async def orchestrate_route(...):
-    # ... existing logic
+    count = result.count if hasattr(result, 'count') else 0
+    return count < limit_per_minute
 ```
 
 **Rate Limits by Endpoint:**
-- `/orchestrate`: **10/minute** (Gemini API constraint)
-- `/execute`: **100/minute** (bulk processing, higher throughput)
-- `/plan`: **20/minute** (AI planning, moderate usage)
-- Individual tools: **50/minute** (reasonable default)
-- `/health`: **Unlimited** (monitoring should never be rate limited)
+- `/plan`: **10/minute**
+- `/execute`: **20/minute**
+- `/orchestrate`: **10/minute**
+- `/workflow/execute`: **10/minute**
+- `/health`: **Unlimited**
 
-**Benefits:**
-- ✅ Prevents Gemini API quota exhaustion
-- ✅ Stops abuse and DDoS attempts
-- ✅ Returns clear 429 error with `Retry-After` header
-- ✅ Per-user rate limiting (when authenticated)
-- ✅ Graceful degradation under load
+**Benefits Achieved:**
+- ✅ Works for sequential requests (prevents abuse from scripts)
+- ✅ Distributed across Modal containers (shared database state)
+- ✅ Per-user rate limiting (authenticated and anonymous)
+- ✅ Fail-open strategy (allows requests if check fails)
 
-**Frontend Impact:** None unless they spam >10 requests/minute (which would fail anyway without rate limiting)
+**Known Limitations:**
+- ⚠️ Concurrent bursts (12+ simultaneous requests) bypass limit due to check-before-log race condition
+- **Future Fix:** Redis/Upstash for atomic increments (estimated 2-3 hours)
+- **Impact:** Low for MVP (works fine for normal traffic patterns)
+
+**Frontend Impact:** None for normal usage patterns
 
 ---
 
-#### 3. Request ID Tracing (1 hour)
+#### 3. Request ID Tracing ✅ IMPLEMENTED
 
-**Why NOW:** Critical for debugging distributed system issues and correlating logs.
+**Implementation Status:** COMPLETE
 
-**Implementation:**
+**What was done:**
+- ✅ HTTP middleware generates UUID for all requests (lines 3588-3595)
+- ✅ X-Request-ID header returned in all responses
+- ✅ Request ID bound to structlog contextvars (appears in all logs)
+- ✅ Enables correlation across distributed system
+
+**Actual Implementation:**
 ```python
-import uuid
-from fastapi import Request, Response
-
-@web_app.post("/execute")
-async def execute_route(request: ExecuteRequest):
-    # Generate unique request ID
+# Request ID middleware (lines 3588-3595)
+@web_app.middleware("http")
+async def add_request_id(request: Request, call_next):
     request_id = str(uuid.uuid4())
-
-    logger.info("request_start",
-        request_id=request_id,
-        endpoint="/execute",
-        tool=request.tool)
-
-    try:
-        # ... existing processing logic
-        result = await process_execution(request, request_id)
-
-        # Return request ID in response header
-        return Response(
-            content=result,
-            headers={"X-Request-ID": request_id}
-        )
-    except Exception as e:
-        logger.error("request_failed",
-            request_id=request_id,
-            error=str(e))
-        raise
+    with structlog.contextvars.bound_contextvars(request_id=request_id):
+        response = await call_next(request)
+        response.headers["X-Request-ID"] = request_id
+        return response
 ```
 
-**Benefits:**
+**Test Results:**
+```bash
+$ curl -I https://scaile--g-mcp-tools-fast-api.modal.run/health
+x-request-id: b486484e-0716-49c2-8161-f8e3d0686146
+```
+
+**Benefits Achieved:**
 - ✅ Correlate logs across multiple tool executions
 - ✅ Frontend can include request_id in bug reports
 - ✅ Debug user-specific issues easily
@@ -501,75 +511,112 @@ async def execute_route(request: ExecuteRequest):
 
 ---
 
-#### 4. Enhanced Health Check (30 minutes)
+#### 4. Enhanced Health Check ✅ IMPLEMENTED
 
-**Why NOW:** Frontend can verify backend dependencies before making requests.
+**Implementation Status:** COMPLETE
 
-**Current Health Check:**
+**What was done:**
+- ✅ Gemini API connectivity test with 2s timeout (lines 3730-3752)
+- ✅ Supabase connectivity test with 2s timeout (lines 3754-3775)
+- ✅ Overall status calculation ("healthy" vs "degraded")
+- ✅ Detailed dependency status reporting
+- ✅ Tool and category enumeration
+
+**Actual Implementation:**
 ```python
-@web_app.get("/health")
+@web_app.get("/health", tags=["System"])
 async def health_check():
-    return {"status": "healthy"}
-```
+    """Enhanced health check endpoint with dependency testing."""
+    categories = list({config["type"] for config in TOOLS.values()})
 
-**Enhanced Implementation:**
-```python
-@web_app.get("/health")
-async def health_check():
-    gemini_ok = await test_gemini_connection()
-    supabase_ok = await test_supabase_connection()
+    # Test dependencies in parallel
+    gemini_health, supabase_health = await asyncio.gather(
+        test_gemini_connection(),
+        test_supabase_connection(),
+        return_exceptions=True
+    )
 
-    status = "healthy" if gemini_ok and supabase_ok else "degraded"
+    # Determine overall status
+    all_healthy = (
+        gemini_health.get("status") == "healthy" and
+        supabase_health.get("status") == "healthy"
+    )
+    overall_status = "healthy" if all_healthy else "degraded"
 
     return {
-        "status": status,
+        "status": overall_status,
+        "service": "g-mcp-tools-fast",
         "version": "1.0.0",
-        "timestamp": datetime.utcnow().isoformat(),
+        "tools": len(TOOLS),
+        "categories": categories,
         "dependencies": {
-            "gemini": {
-                "status": "healthy" if gemini_ok else "unavailable",
-                "service": "google-generativeai"
-            },
-            "supabase": {
-                "status": "healthy" if supabase_ok else "unavailable",
-                "service": "supabase-python"
-            },
-            "modal": {
-                "status": "healthy",
-                "service": "modal-platform"
-            }
+            "gemini": gemini_health,
+            "supabase": supabase_health
         },
-        "metrics": {
-            "total_tools": 14,
-            "workflow_endpoints": 4
-        }
+        "timestamp": datetime.now().isoformat() + "Z",
     }
 
-async def test_gemini_connection() -> bool:
-    """Test Gemini API connectivity."""
+async def test_gemini_connection() -> Dict[str, Any]:
+    """Test Gemini API connectivity with minimal request."""
     try:
-        # Simple API call to verify connection
-        response = await gemini_client.generate_content("test")
-        return True
-    except Exception:
-        return False
+        genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
+        model = genai.GenerativeModel("gemini-2.0-flash-exp")
+        response = await asyncio.wait_for(
+            asyncio.to_thread(model.generate_content, "test"),
+            timeout=2.0
+        )
+        return {"status": "healthy", "model": "gemini-2.0-flash-exp"}
+    except asyncio.TimeoutError:
+        return {"status": "timeout", "error": "Request timed out after 2s"}
+    except Exception as e:
+        return {"status": "unavailable", "error": str(e)[:100]}
 
-async def test_supabase_connection() -> bool:
-    """Test Supabase connectivity."""
+async def test_supabase_connection() -> Dict[str, Any]:
+    """Test Supabase connectivity with minimal query."""
     try:
-        # Simple query to verify connection
-        response = supabase.table("api_calls").select("id").limit(1).execute()
-        return True
-    except Exception:
-        return False
+        supabase = create_client(url, key)
+        result = await asyncio.wait_for(
+            asyncio.to_thread(lambda: supabase.table("api_calls").select("id").limit(1).execute()),
+            timeout=2.0
+        )
+        return {"status": "healthy", "database": "connected"}
+    except asyncio.TimeoutError:
+        return {"status": "timeout", "error": "Request timed out after 2s"}
+    except Exception as e:
+        return {"status": "unavailable", "error": str(e)[:100]}
 ```
 
-**Benefits:**
+**Test Results:**
+```bash
+$ curl -s https://scaile--g-mcp-tools-fast-api.modal.run/health | jq .
+{
+  "status": "healthy",
+  "service": "g-mcp-tools-fast",
+  "version": "1.0.0",
+  "tools": 14,
+  "categories": ["generation", "analysis", "enrichment"],
+  "dependencies": {
+    "gemini": {
+      "status": "healthy",
+      "model": "gemini-2.0-flash-exp"
+    },
+    "supabase": {
+      "status": "healthy",
+      "database": "connected"
+    }
+  },
+  "timestamp": "2025-10-29T21:39:16.274142Z"
+}
+```
+
+**Benefits Achieved:**
 - ✅ Detect backend dependency issues proactively
 - ✅ Status page integration (uptime monitoring)
 - ✅ Frontend can show "service degraded" banner
 - ✅ Version tracking for compatibility checks
-- ✅ Metrics for monitoring dashboards
+- ✅ Metrics for monitoring dashboards (14 tools, 3 categories)
+- ✅ Parallel health checks (faster response time)
+- ✅ Timeout handling prevents hanging requests
 
 **Frontend Impact:** POSITIVE - Can detect and surface backend issues early
 
