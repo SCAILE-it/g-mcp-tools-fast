@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
 
+from v2.api.dependencies import get_tools_registry
 from v2.api.middleware import APILoggingMiddleware, QuotaMiddleware
 from v2.api.models import EnrichAutoRequest, EnrichRequest
 from v2.infrastructure.auth import get_current_user
@@ -120,7 +121,9 @@ async def _run_enrichments(
 
 @router.post("/enrich")
 async def multi_tool_enrich(
-    request_data: EnrichRequest, user_id: Optional[str] = Depends(get_current_user)
+    request_data: EnrichRequest,
+    user_id: Optional[str] = Depends(get_current_user),
+    tools: Dict[str, Any] = Depends(get_tools_registry),
 ):
     """Enrich a single record with multiple tools."""
     start_time = time.time()
@@ -128,9 +131,6 @@ async def multi_tool_enrich(
     # Quota enforcement for authenticated users
     if user_id:
         await _quota.check_quota(user_id)
-
-    # Import TOOLS registry
-    TOOLS: Dict[str, Any] = {}  # TODO: Get from app.state or dependency
 
     data = request_data.data
     tool_names = request_data.tools
@@ -198,7 +198,7 @@ async def multi_tool_enrich(
             )
             return JSONResponse(status_code=400, content=error_response)
 
-        result = await _run_enrichments(data, tool_specs, TOOLS)
+        result = await _run_enrichments(data, tool_specs, tools)
         response = {
             "success": True,
             "data": result,
@@ -237,7 +237,9 @@ async def multi_tool_enrich(
 
 @router.post("/enrich/auto")
 async def auto_enrich(
-    request_data: EnrichAutoRequest, user_id: Optional[str] = Depends(get_current_user)
+    request_data: EnrichAutoRequest,
+    user_id: Optional[str] = Depends(get_current_user),
+    tools: Dict[str, Any] = Depends(get_tools_registry),
 ):
     """Auto-detect and enrich a single record with appropriate tools."""
     start_time = time.time()
@@ -245,9 +247,6 @@ async def auto_enrich(
     # Quota enforcement for authenticated users
     if user_id:
         await _quota.check_quota(user_id)
-
-    # Import TOOLS registry
-    TOOLS: Dict[str, Any] = {}  # TODO: Get from app.state or dependency
 
     data = request_data.data
     if not isinstance(data, dict):
@@ -287,7 +286,7 @@ async def auto_enrich(
             )
             return JSONResponse(content=response)
 
-        result = await _run_enrichments(data, tool_specs, TOOLS)
+        result = await _run_enrichments(data, tool_specs, tools)
         response = {
             "success": True,
             "data": result,

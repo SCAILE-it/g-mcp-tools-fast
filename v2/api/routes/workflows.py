@@ -9,6 +9,7 @@ from typing import Any, Dict, Optional
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from v2.api.dependencies import get_tools_registry
 from v2.api.middleware import APILoggingMiddleware, QuotaMiddleware, check_rate_limit
 from v2.api.models import WorkflowExecuteRequest, WorkflowGenerateRequest
 from v2.api.utils import create_sse_event
@@ -43,6 +44,7 @@ async def workflow_execute_route(
     request: Request,
     request_data: WorkflowExecuteRequest,
     user_id: Optional[str] = Depends(get_current_user),
+    tools: Dict[str, Any] = Depends(get_tools_registry),
 ):
     """Execute JSON-based workflow with SSE streaming.
 
@@ -65,15 +67,12 @@ async def workflow_execute_route(
             },
         )
 
-    # Import TOOLS registry
-    TOOLS: Dict[str, Any] = {}  # TODO: Get from app.state or dependency
-
     try:
         # Get system context from request headers
         system_context = _get_system_context(request)
 
         # Initialize workflow executor
-        tool_registry = ToolRegistry(TOOLS)
+        tool_registry = ToolRegistry(tools)
         workflow_executor = WorkflowExecutor(tool_registry)
 
         # SSE streaming

@@ -8,6 +8,7 @@ from typing import Any, Dict, Optional
 from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
 
+from v2.api.dependencies import get_tools_registry
 from v2.api.middleware import APILoggingMiddleware, QuotaMiddleware
 from v2.api.models import BulkAutoProcessRequest, BulkProcessRequest
 from v2.core.batch import BatchProcessor
@@ -98,7 +99,9 @@ async def _process_batch_internal(
 
 @router.post("/bulk")
 async def bulk_process(
-    request_data: BulkProcessRequest, user_id: Optional[str] = Depends(get_current_user)
+    request_data: BulkProcessRequest,
+    user_id: Optional[str] = Depends(get_current_user),
+    tools: Dict[str, Any] = Depends(get_tools_registry),
 ):
     """Process multiple records in parallel with specified tools.
 
@@ -114,9 +117,6 @@ async def bulk_process(
     tool_names = request_data.tools
     webhook_url = request_data.webhook_url
 
-    # Import TOOLS registry
-    TOOLS: Dict[str, Any] = {}  # TODO: Get from app.state or dependency
-
     # Quota enforcement: Bulk = N API calls (one per row)
     if user_id:
         for _ in range(len(rows)):
@@ -125,7 +125,7 @@ async def bulk_process(
     try:
         batch_id = f"batch_{int(time.time() * 1000)}_{secrets.token_urlsafe(8)}"
         result = await _process_batch_internal(
-            batch_id, rows, False, tool_names, webhook_url, TOOLS
+            batch_id, rows, False, tool_names, webhook_url, tools
         )
 
         response = {
@@ -177,6 +177,7 @@ async def bulk_process(
 async def bulk_auto_process(
     request_data: BulkAutoProcessRequest,
     user_id: Optional[str] = Depends(get_current_user),
+    tools: Dict[str, Any] = Depends(get_tools_registry),
 ):
     """Process multiple records in parallel with auto-detection.
 
@@ -190,9 +191,6 @@ async def bulk_auto_process(
     rows = request_data.rows
     webhook_url = request_data.webhook_url
 
-    # Import TOOLS registry
-    TOOLS: Dict[str, Any] = {}  # TODO: Get from app.state or dependency
-
     # Quota enforcement: Bulk = N API calls (one per row)
     if user_id:
         for _ in range(len(rows)):
@@ -200,7 +198,7 @@ async def bulk_auto_process(
 
     try:
         batch_id = f"batch_{int(time.time() * 1000)}_{secrets.token_urlsafe(8)}"
-        result = await _process_batch_internal(batch_id, rows, True, None, webhook_url, TOOLS)
+        result = await _process_batch_internal(batch_id, rows, True, None, webhook_url, tools)
 
         response = {
             "success": True,

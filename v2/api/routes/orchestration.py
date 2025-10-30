@@ -7,6 +7,7 @@ from typing import Any, AsyncIterator, Dict, List, Optional
 from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from v2.api.dependencies import get_tools_registry
 from v2.api.middleware import APILoggingMiddleware, QuotaMiddleware, check_rate_limit
 from v2.api.models import ExecuteRequest, OrchestrateRequest, PlanRequest
 from v2.api.utils import create_sse_event
@@ -150,7 +151,9 @@ async def plan_route(
 
 @router.post("/execute")
 async def execute_route(
-    request_data: ExecuteRequest, user_id: Optional[str] = Depends(get_current_user)
+    request_data: ExecuteRequest,
+    user_id: Optional[str] = Depends(get_current_user),
+    tools: Dict[str, Any] = Depends(get_tools_registry),
 ):
     """Execute single tool on multiple rows with SSE streaming.
 
@@ -175,18 +178,13 @@ async def execute_route(
             },
         )
 
-    # Import TOOLS registry from app state (injected at app creation)
-    # For now, we'll need to pass it as a dependency or use a global registry
-    # This will be resolved when we update app.py
-    TOOLS: Dict[str, Any] = {}  # TODO: Get from app.state or dependency
-
     try:
         # Quota enforcement for authenticated users
         if user_id:
             await _quota.check_quota(user_id)
 
         # Validate tool exists
-        if request_data.tool not in TOOLS:
+        if request_data.tool not in tools:
             return JSONResponse(
                 status_code=400,
                 content={
@@ -202,7 +200,7 @@ async def execute_route(
 
             try:
                 async for event in _process_rows_with_progress(
-                    request_data.tool, request_data.data, request_data.params, TOOLS
+                    request_data.tool, request_data.data, request_data.params, tools
                 ):
                     event_type = event.get("event", "message")
                     event_data = event.get("data", {})
@@ -227,7 +225,7 @@ async def execute_route(
                 # Log usage for authenticated users after streaming completes
                 if user_id and final_result:
                     processing_ms = int((time.time() - start_time) * 1000)
-                    tool_config = TOOLS.get(request_data.tool, {})
+                    tool_config = tools.get(request_data.tool, {})
                     tool_type = tool_config.get("type", "unknown")
 
                     _logging.log_call(
@@ -263,7 +261,9 @@ async def execute_route(
 
 @router.post("/orchestrate")
 async def orchestrate_route(
-    request_data: OrchestrateRequest, user_id: Optional[str] = Depends(get_current_user)
+    request_data: OrchestrateRequest,
+    user_id: Optional[str] = Depends(get_current_user),
+    tools: Dict[str, Any] = Depends(get_tools_registry),
 ):
     """Orchestrate full AI workflow with SSE streaming.
 
@@ -288,9 +288,6 @@ async def orchestrate_route(
             },
         )
 
-    # Import TOOLS registry
-    TOOLS: Dict[str, Any] = {}  # TODO: Get from app.state or dependency
-
     try:
         user_request = request_data.user_request
         stream_mode = request_data.stream
@@ -300,7 +297,7 @@ async def orchestrate_route(
             await _quota.check_quota(user_id)
 
         # Initialize Orchestrator with TOOLS registry
-        orchestrator = Orchestrator(TOOLS)
+        orchestrator = Orchestrator(tools)
 
         # Streaming mode (SSE)
         if stream_mode:
