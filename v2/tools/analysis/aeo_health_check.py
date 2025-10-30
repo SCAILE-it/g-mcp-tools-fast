@@ -6,7 +6,7 @@ Analyzes website SEO/AEO health with AI insights.
 import re
 from typing import Any, Dict
 
-from v2.integrations.gemini.client import GeminiGroundingClient
+from v2.integrations.gemini import GeminiGroundingClient
 from v2.utils.html import fetch_html_content
 from v2.utils.decorators import enrichment_tool
 
@@ -35,7 +35,7 @@ async def aeo_health_check(url: str) -> Dict[str, Any]:
     title_score = 10 if 30 <= len(title_text) <= 60 else 5 if title_text else 0
 
     meta_desc = soup.find('meta', attrs={'name': 'description'})
-    meta_text = meta_desc.get('content', '').strip() if meta_desc else ""
+    meta_text = str(meta_desc.get('content', '')).strip() if meta_desc else ""
     meta_score = 10 if 120 <= len(meta_text) <= 160 else 5 if meta_text else 0
 
     h1_tags = soup.find_all('h1')

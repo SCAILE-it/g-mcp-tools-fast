@@ -5,7 +5,7 @@ Performs multi-query research with synthesis using Gemini.
 
 from typing import Any, Dict
 
-from v2.integrations.gemini.client import GeminiGroundingClient
+from v2.integrations.gemini import GeminiGroundingClient
 from v2.tools.generation.web_search import web_search
 from v2.utils.decorators import enrichment_tool
 

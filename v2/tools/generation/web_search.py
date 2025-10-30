@@ -5,7 +5,7 @@ Performs web search using Gemini grounding.
 
 from typing import Any, Dict
 
-from v2.integrations.gemini.client import GeminiGroundingClient
+from v2.integrations.gemini import GeminiGroundingClient
 from v2.utils.grounding import extract_citations_from_grounding, extract_search_queries_from_grounding
 from v2.utils.decorators import enrichment_tool
 

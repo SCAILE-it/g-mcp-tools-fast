@@ -5,7 +5,7 @@ Creates blog content from template with optional research integration.
 
 from typing import Any, Dict, Optional
 
-from v2.integrations.gemini.client import GeminiGroundingClient
+from v2.integrations.gemini import GeminiGroundingClient
 from v2.tools.generation.deep_research import deep_research
 from v2.utils.templates import render_template
 from v2.utils.decorators import enrichment_tool
