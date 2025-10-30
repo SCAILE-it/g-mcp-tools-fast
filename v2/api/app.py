@@ -6,7 +6,8 @@ from fastapi import FastAPI
 from fastapi.openapi.utils import get_openapi
 
 from v2.api.middleware import request_id_middleware
-from v2.api.routes import system
+from v2.api.routes import bulk, enrichment, orchestration, scraping, system, workflows
+from v2.api.routes.tools import register_tool_routes
 
 
 def create_app(tools_registry: Optional[Dict[str, Any]] = None) -> FastAPI:
@@ -29,8 +30,17 @@ def create_app(tools_registry: Optional[Dict[str, Any]] = None) -> FastAPI:
 
     # Register routes
     app.include_router(system.router)
+    app.include_router(orchestration.router)
+    app.include_router(workflows.router)
+    app.include_router(enrichment.router)
+    app.include_router(bulk.router)
+    app.include_router(scraping.router)
 
-    # Store tools registry for health check
+    # Register dynamic tool routes (if tools registry provided)
+    if tools_registry:
+        register_tool_routes(app, tools_registry)
+
+    # Store tools registry for route access
     if tools_registry:
         app.state.tools_registry = tools_registry
 
