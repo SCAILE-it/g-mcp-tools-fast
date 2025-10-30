@@ -26,16 +26,23 @@ class APICallRecord:
 
 @dataclass
 class SavedJob:
-    """Represents a saved/scheduled job in saved_queries table."""
+    """Represents a saved/scheduled job in saved_queries table.
+
+    Tool-based saved jobs that can be executed manually or on a schedule.
+    """
 
     id: str
     user_id: str
-    workflow_name: str
-    workflow_type: str
+    name: str
+    tool_name: str
     params: Dict[str, Any]
-    is_scheduled: bool
+    description: Optional[str] = None
+    is_template: bool = False
+    template_vars: Optional[list] = None
+    is_scheduled: bool = False
     schedule_preset: Optional[str] = None
-    next_run_at: Optional[datetime] = None
-    last_run_at: Optional[datetime] = None
-    created_at: Optional[datetime] = None
-    updated_at: Optional[datetime] = None
+    schedule_cron: Optional[str] = None
+    next_run_at: Optional[str] = None
+    last_run_at: Optional[str] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
