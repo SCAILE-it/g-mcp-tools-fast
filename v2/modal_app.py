@@ -43,6 +43,7 @@ image = (
         "phonenumbers>=8.13",
         "python-whois>=0.9",
         "dnspython>=2.4.0",
+        "email-validator>=2.0.0",
         # Supabase
         "supabase>=2.0.0",
         "pyjwt>=2.8.0",
