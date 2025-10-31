@@ -3,10 +3,11 @@
 import asyncio
 import os
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Depends, Request
 
+from v2.api.dependencies import get_tools_registry
 
 router = APIRouter(tags=["System"])
 
@@ -62,15 +63,11 @@ async def test_supabase_connection() -> Dict[str, Any]:
 
 
 @router.get("/health")
-async def health_check(tools_registry: Optional[Dict[str, Any]] = None):
+async def health_check(tools_registry: Dict[str, Any] = Depends(get_tools_registry)):
     """Health check with Gemini/Supabase testing. Returns service status, version, tool count, and dependency health."""
-    # Get tool categories if registry provided
-    if tools_registry:
-        categories = list({config["type"] for config in tools_registry.values()})
-        tool_count = len(tools_registry)
-    else:
-        categories = []
-        tool_count = 0
+    # Get tool categories from registry
+    categories = list({config["type"] for config in tools_registry.values()}) if tools_registry else []
+    tool_count = len(tools_registry)
 
     # Test dependencies in parallel
     results = await asyncio.gather(

@@ -288,56 +288,47 @@ Return ONLY the JSON workflow object, no markdown code blocks or explanations.""
 
 
 @router.get("/tools")
-async def tools_list_route(user_id: Optional[str] = Depends(get_current_user)):
-    """List all available tools from tool_definitions table."""
+async def tools_list_route(
+    user_id: Optional[str] = Depends(get_current_user),
+    tools: Dict[str, Any] = Depends(get_tools_registry),
+):
+    """List all available tools from TOOLS registry."""
     try:
-        from supabase import create_client
+        if not tools:
+            return {"success": True, "tools": [], "by_category": {}, "total": 0}
 
-        supabase_url = os.environ.get("SUPABASE_URL")
-        supabase_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
-
-        if not supabase_url or not supabase_key:
-            return JSONResponse(
-                status_code=500,
-                content={"success": False, "error": "Supabase not configured"},
-            )
-
-        supabase = create_client(supabase_url, supabase_key)
-
-        # Fetch all active tools
-        response = (
-            supabase.table("tool_definitions")
-            .select("tool_name, tool_type, category, display_name, description")
-            .eq("is_active", True)
-            .execute()
-        )
-
-        if not response.data:
-            return {"success": True, "tools": [], "total": 0}
-
-        # Group by category
+        # Build tools list from registry
+        tools_list = []
         by_category: Dict[str, list] = {}
-        for tool in response.data:
-            category = tool["category"]
-            if category not in by_category:
-                by_category[category] = []
-            by_category[category].append(
-                {
-                    "name": tool["tool_name"],
-                    "type": tool["tool_type"],
-                    "display_name": tool["display_name"],
-                    "description": tool["description"],
-                }
-            )
+
+        for tool_name, tool_config in tools.items():
+            tool_type = tool_config.get("type", "unknown")
+            tag = tool_config.get("tag", "Unknown")
+            doc = tool_config.get("doc", "No description")
+
+            tool_data = {
+                "name": tool_name,
+                "type": tool_type,
+                "tag": tag,
+                "description": doc.split("\n\n")[0],  # First line of doc
+            }
+
+            tools_list.append(tool_data)
+
+            # Group by type (category)
+            if tool_type not in by_category:
+                by_category[tool_type] = []
+            by_category[tool_type].append(tool_data)
 
         return {
             "success": True,
-            "tools": response.data,
+            "tools": tools_list,
             "by_category": by_category,
-            "total": len(response.data),
+            "total": len(tools_list),
         }
 
     except Exception as e:
+        logger.error("tools_list_failed", error=str(e))
         return JSONResponse(
             status_code=500, content={"success": False, "error": str(e)}
         )
