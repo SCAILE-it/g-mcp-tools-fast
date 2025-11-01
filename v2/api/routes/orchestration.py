@@ -87,6 +87,7 @@ async def plan_route(
         - **success**: bool
         - **plan**: List of step descriptions
         - **total_steps**: Number of steps in plan
+        - **sources**: List of data sources used (files, APIs, web) - NEW
     """
     # Rate limiting check
     if not await check_rate_limit(user_id, "/plan", 10):
@@ -101,35 +102,83 @@ async def plan_route(
 
     start_time = time.time()
     try:
+        # Import file processing utilities (lazy import to avoid circular dependencies)
+        from v2.utils.file_processor import FileProcessor
+        from v2.utils.sources_tracker import SourcesTracker
+
         user_request = request_data.user_request
+        company_context = request_data.company_context
+        enabled_tools = request_data.enabled_tools
+        files = request_data.files or []
+        request_user_id = request_data.user_id or user_id
+
+        # Process uploaded files if provided
+        processed_files = []
+        if files:
+            processed_files = await FileProcessor.process_files(files)
+
+        # Initialize sources tracker
+        sources_tracker = SourcesTracker.from_files(processed_files)
+
+        # Enhance user_request with company context if provided
+        enhanced_request = user_request
+        if company_context:
+            context_str = "\n".join(
+                [f"{key}: {value}" for key, value in company_context.items()]
+            )
+            enhanced_request = f"{user_request}\n\nCompany Context:\n{context_str}"
 
         # Initialize Planner
         planner = Planner()
 
-        # Generate plan
-        plan = planner.generate(user_request)
+        # Generate plan with enabled_tools filtering and file context
+        plan = planner.generate(
+            enhanced_request,
+            enabled_tools=enabled_tools,
+            file_context=processed_files,
+        )
+
+        # Add reasoning for complex plans (2+ steps)
+        reasoning = None
+        if len(plan) >= 2:
+            reasoning = (
+                f"This is a multi-step workflow that requires {len(plan)} steps. "
+                f"Each step will be executed sequentially to complete your request."
+            )
 
         # Log successful API call
         processing_ms = int((time.time() - start_time) * 1000)
         _logging.log_call(
-            user_id=user_id or "00000000-0000-0000-0000-000000000000",
+            user_id=request_user_id or "00000000-0000-0000-0000-000000000000",
             tool_name="/plan",
             tool_type="orchestration",
-            input_data={"user_request": user_request},
+            input_data={
+                "user_request": user_request,
+                "has_company_context": company_context is not None,
+                "enabled_tools": enabled_tools,
+                "files_count": len(files),
+            },
             output_data={"plan": plan, "total_steps": len(plan)},
             success=True,
             processing_ms=processing_ms,
         )
 
-        return {
+        response = {
             "success": True,
-            "plan": plan,
+            "plan": {"steps": plan},
             "total_steps": len(plan),
+            "sources": sources_tracker.get_sources(),  # NEW: Track data sources
             "metadata": {
                 "user_request": user_request,
                 "generated_at": datetime.now().isoformat() + "Z",
             },
         }
+
+        # Add reasoning only for complex plans
+        if reasoning:
+            response["reasoning"] = reasoning
+
+        return response
     except Exception as e:
         # Log failed API call
         processing_ms = int((time.time() - start_time) * 1000)
@@ -292,9 +341,18 @@ async def orchestrate_route(
         user_request = request_data.user_request
         stream_mode = request_data.stream
 
+        # Extract plan_steps from request_data.plan if provided
+        plan_steps = None
+        if request_data.plan:
+            plan_steps = request_data.plan.get("steps")
+
+        # Get company_context and user_id from request
+        company_context = request_data.company_context
+        request_user_id = request_data.user_id or user_id
+
         # Quota enforcement for authenticated users
-        if user_id:
-            await _quota.check_quota(user_id)
+        if request_user_id:
+            await _quota.check_quota(request_user_id)
 
         # Initialize Orchestrator with TOOLS registry
         orchestrator = Orchestrator(tools)
@@ -305,7 +363,11 @@ async def orchestrate_route(
             async def event_generator():
                 final_result = None
                 try:
-                    async for event in orchestrator.execute_plan_stream(user_request):
+                    async for event in orchestrator.execute_plan_stream(
+                        user_request,
+                        plan_steps=plan_steps,
+                        company_context=company_context
+                    ):
                         event_type = event.get("event", "message")
                         event_data = event.get("data", {})
 
@@ -323,12 +385,17 @@ async def orchestrate_route(
 
                 finally:
                     # Log usage for authenticated users after streaming completes
-                    if user_id and final_result:
+                    if request_user_id and final_result:
                         _logging.log_call(
-                            user_id=user_id,
+                            user_id=request_user_id,
                             tool_name="orchestrator",
                             tool_type="ai_orchestration",
-                            input_data={"user_request": user_request, "stream": True},
+                            input_data={
+                                "user_request": user_request,
+                                "stream": True,
+                                "has_plan": plan_steps is not None,
+                                "has_company_context": company_context is not None,
+                            },
                             output_data=final_result,
                             success=final_result.get("successful", 0) > 0,
                             processing_ms=0,
@@ -347,15 +414,23 @@ async def orchestrate_route(
 
         # Blocking mode (regular JSON response)
         else:
-            result = await orchestrator.execute_plan(user_request)
+            result = await orchestrator.execute_plan(
+                user_request,
+                plan_steps=plan_steps,
+                company_context=company_context
+            )
 
             # Log usage for authenticated users
-            if user_id:
+            if request_user_id:
                 _logging.log_call(
-                    user_id=user_id,
+                    user_id=request_user_id,
                     tool_name="orchestrator",
                     tool_type="ai_orchestration",
-                    input_data={"user_request": user_request},
+                    input_data={
+                        "user_request": user_request,
+                        "has_plan": plan_steps is not None,
+                        "has_company_context": company_context is not None,
+                    },
                     output_data=result,
                     success=result["success"],
                     processing_ms=0,

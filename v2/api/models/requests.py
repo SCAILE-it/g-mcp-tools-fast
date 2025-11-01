@@ -92,11 +92,38 @@ class BaseBulkModel(BaseModel):
 class PlanRequest(BaseUserRequestModel):
     """Request for /plan endpoint - AI-powered execution planning."""
 
+    user_id: Optional[str] = Field(None, description="User ID for analytics and logging")
+    company_context: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Company context for enhanced AI responses (name, industry, etc.)",
+    )
+    enabled_tools: Optional[List[str]] = Field(
+        None,
+        description="List of enabled tool names to filter available tools (if None, all tools available)",
+    )
+    files: Optional[List[Dict[str, Any]]] = Field(
+        None,
+        description="Uploaded files with signed URLs for context (CSV, JSON, TXT, PDF)",
+    )
+
     model_config = {
         "json_schema_extra": {
             "examples": [
                 {
-                    "user_request": "Research Tesla and find contact information for their sales team"
+                    "user_request": "Research Tesla and find contact information for their sales team",
+                    "company_context": {
+                        "company_name": "Acme Corp",
+                        "industry": "B2B SaaS",
+                    },
+                    "enabled_tools": ["googleSearch", "emailValidator"],
+                    "files": [
+                        {
+                            "file_id": "uuid-1234",
+                            "url": "https://storage.supabase.co/object/sign/files/uuid?token=...",
+                            "filename": "companies.csv",
+                            "media_type": "text/csv",
+                        }
+                    ],
                 }
             ]
         }
@@ -107,6 +134,15 @@ class OrchestrateRequest(BaseUserRequestModel):
     """Request for /orchestrate endpoint - full AI workflow orchestration."""
 
     stream: bool = Field(default=True, description="Enable SSE streaming")
+    user_id: Optional[str] = Field(None, description="User ID for analytics and logging")
+    company_context: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Company context for enhanced AI responses (name, industry, etc.)",
+    )
+    plan: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Pre-approved execution plan to reuse (skips planning step)",
+    )
 
     model_config = {
         "json_schema_extra": {
@@ -114,6 +150,8 @@ class OrchestrateRequest(BaseUserRequestModel):
                 {
                     "user_request": "Research Tesla and find contact information",
                     "stream": True,
+                    "company_context": {"company_name": "Acme Corp"},
+                    "plan": {"steps": ["Research Tesla", "Find contacts"]},
                 }
             ]
         }
@@ -197,6 +235,35 @@ class BulkAutoProcessRequest(BaseBulkModel):
                     "rows": [
                         {"email": "john@example.com", "phone": "+14155552671"}
                     ]
+                }
+            ]
+        }
+    }
+
+
+class BulkGenericRequest(BaseBulkModel):
+    """Request for /bulk/generic endpoint - bulk processing with custom prompts."""
+
+    prompt: str = Field(..., min_length=1, description="Prompt template with {{variable}} syntax")
+    output_schema: Optional[List[Dict[str, str]]] = Field(
+        None, description="Optional JSON schema for structured output"
+    )
+    context: Optional[str] = Field(None, description="Optional context/system instruction")
+    temperature: float = Field(0.7, ge=0.0, le=1.0, description="Gemini temperature (0.0-1.0)")
+    max_tokens: int = Field(8192, ge=100, le=32000, description="Max tokens to generate")
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "rows": [
+                        {"name": "John", "company": "Acme"},
+                        {"name": "Jane", "company": "BigCorp"}
+                    ],
+                    "prompt": "Write a professional bio for {{name}} at {{company}}",
+                    "output_schema": [{"name": "bio"}],
+                    "context": "Professional LinkedIn bios",
+                    "temperature": 0.7
                 }
             ]
         }
