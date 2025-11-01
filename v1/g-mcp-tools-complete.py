@@ -136,6 +136,198 @@ class WorkflowExecuteRequest(BaseModel):
     inputs: Dict[str, Any]
 
 
+# Base Models (DRY - reusable components)
+
+class BaseUserRequestModel(BaseModel):
+    """Base model for endpoints accepting natural language requests."""
+    user_request: str = Field(
+        ...,
+        min_length=1,
+        description="Natural language task description (e.g., 'Find email for john@company.com and validate it')"
+    )
+
+
+class BaseEnrichModel(BaseModel):
+    """Base model for enrichment endpoints."""
+    data: Dict[str, Any] = Field(
+        ...,
+        description="Record to enrich with any fields"
+    )
+
+
+class BaseBulkModel(BaseModel):
+    """Base model for bulk processing endpoints."""
+    rows: List[Dict[str, Any]] = Field(
+        ...,
+        min_items=1,
+        max_items=10000,
+        description="List of records to enrich (max 10,000 rows)"
+    )
+    webhook_url: Optional[str] = Field(
+        None,
+        description="Optional webhook URL for completion notification"
+    )
+
+
+# Endpoint-Specific Models
+
+class PlanRequest(BaseUserRequestModel):
+    """Request for /plan endpoint - AI-powered execution planning."""
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {"user_request": "Research Tesla and find contact information for their sales team"},
+                {"user_request": "Analyze the tech stack for stripe.com and check their domain registration"}
+            ]
+        }
+    }
+
+
+class OrchestrateRequest(BaseUserRequestModel):
+    """Request for /orchestrate endpoint - full AI workflow orchestration."""
+    stream: bool = Field(default=True, description="Enable SSE streaming for real-time progress updates")
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {"user_request": "Research Tesla and find contact information for their sales team", "stream": True}
+            ]
+        }
+    }
+
+
+class WorkflowGenerateRequest(BaseUserRequestModel):
+    """Request for /workflow/generate endpoint - AI workflow generation."""
+    save_as: Optional[str] = Field(None, description="Optional workflow name to save after generation")
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {"user_request": "Create a workflow to validate emails and check tech stack for each domain"}
+            ]
+        }
+    }
+
+
+class EnrichRequest(BaseEnrichModel):
+    """Request for /enrich endpoint - multi-tool single record enrichment."""
+    tools: List[str] = Field(..., min_items=1, description="List of tool names to apply (e.g., ['email-intel', 'phone-validation'])")
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {"data": {"email": "john@example.com", "company": "Acme Corp"}, "tools": ["email-intel", "company-data"]}
+            ]
+        }
+    }
+
+
+class EnrichAutoRequest(BaseEnrichModel):
+    """Request for /enrich/auto endpoint - auto-detect enrichment tools."""
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {"data": {"email": "john@example.com", "phone": "+14155552671", "domain": "example.com"}}
+            ]
+        }
+    }
+
+
+class BulkProcessRequest(BaseBulkModel):
+    """Request for /bulk endpoint - bulk processing with specified tools."""
+    tools: List[str] = Field(..., min_items=1, description="List of tool names to apply to ALL rows")
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {"rows": [{"email": "john@example.com"}, {"email": "jane@example.com"}], "tools": ["email-intel", "email-validate"]}
+            ]
+        }
+    }
+
+
+class BulkAutoProcessRequest(BaseBulkModel):
+    """Request for /bulk/auto endpoint - bulk processing with auto-detection."""
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {"rows": [{"email": "john@example.com", "phone": "+14155552671"}, {"domain": "example.com"}]}
+            ]
+        }
+    }
+
+
+class SavedJobCreateRequest(BaseModel):
+    """Request for POST /jobs/saved endpoint - create saved job."""
+    name: str = Field(
+        ...,
+        min_length=1,
+        description="Job name"
+    )
+    description: Optional[str] = Field(
+        None,
+        description="Optional job description"
+    )
+    tool_name: str = Field(
+        ...,
+        description="Tool to execute (e.g., 'phone-validation', 'email-intel')"
+    )
+    params: Dict[str, Any] = Field(
+        ...,
+        description="Tool-specific parameters",
+    )
+    is_template: bool = Field(
+        default=False,
+        description="Whether this is a template job with variables"
+    )
+    template_vars: Optional[List[str]] = Field(
+        None,
+        description="List of template variable names (if is_template=true)"
+    )
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "name": "Daily Phone Validation",
+                    "description": "Validate customer phone numbers",
+                    "tool_name": "phone-validation",
+                    "params": {"phone_number": "+14155552671"},
+                    "is_template": False
+                }
+            ]
+        }
+    }
+
+
+class JobScheduleUpdateRequest(BaseModel):
+    """Request for PATCH /jobs/saved/{job_id}/schedule endpoint - update job schedule."""
+    is_scheduled: bool = Field(
+        ...,
+        description="Enable (true) or disable (false) scheduling"
+    )
+    schedule_preset: Optional[str] = Field(
+        None,
+        description="Schedule preset: 'daily', 'weekly', or 'monthly'",
+        pattern="^(daily|weekly|monthly)$"
+    )
+    schedule_cron: Optional[str] = Field(
+        None,
+        description="Custom cron expression (mutually exclusive with schedule_preset)"
+    )
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "is_scheduled": True,
+                    "schedule_preset": "daily"
+                }
+            ]
+        }
+    }
+
+
 # CACHING & HELPERS
 
 _cache: Dict[str, tuple[Any, datetime]] = {}
@@ -470,6 +662,12 @@ class GeminiGroundingClient:
                 "Gemini API key required. Set GOOGLE_GENERATIVE_AI_API_KEY or GEMINI_API_KEY environment variable."
             )
         self.api_key = api_key
+        self.safety_settings = [
+            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_ONLY_HIGH"},
+            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_ONLY_HIGH"},
+            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_ONLY_HIGH"},
+            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_ONLY_HIGH"}
+        ]
         self._init_genai()
 
     def _init_genai(self) -> None:
@@ -516,7 +714,8 @@ Please provide:
 
             model = self.genai.GenerativeModel(
                 model_name="gemini-2.5-flash",
-                system_instruction=enhanced_instruction
+                system_instruction=enhanced_instruction,
+                safety_settings=self.safety_settings
             )
 
             response = await asyncio.to_thread(
@@ -545,7 +744,8 @@ Please provide:
         try:
             model = self.genai.GenerativeModel(
                 model_name="gemini-2.5-flash",
-                system_instruction=system_instruction
+                system_instruction=system_instruction,
+                safety_settings=self.safety_settings
             )
 
             response = await asyncio.to_thread(
@@ -3833,7 +4033,7 @@ def api():
     @web_app.post("/plan", tags=["AI Orchestration"])
     async def plan_route(
         request: Request,
-        request_data: Dict[str, Any] = Body(...),
+        request_data: PlanRequest,
         user_id: Optional[str] = Depends(get_current_user)
     ):
         """
@@ -3841,12 +4041,11 @@ def api():
 
         Phase 3.1: Planner - Returns numbered list of steps for orchestrated execution.
 
-        - **user_request**: Natural language task description
-
         Returns:
             - **success**: bool
             - **plan**: List of step descriptions
             - **total_steps**: Number of steps in plan
+            - **metadata**: Request metadata
         """
         # Rate limiting check
         if not await check_rate_limit(user_id, "/plan", 10):
@@ -3861,12 +4060,7 @@ def api():
 
         start_time = time.time()
         try:
-            user_request = request_data.get("user_request")
-            if not user_request:
-                return JSONResponse(
-                    status_code=400,
-                    content={"success": False, "error": "Missing required field: user_request"}
-                )
+            user_request = request_data.user_request
 
             # Initialize Planner
             planner = Planner()
@@ -4030,16 +4224,13 @@ def api():
     @web_app.post("/orchestrate", tags=["AI Orchestration"])
     async def orchestrate_route(
         request: Request,
-        request_data: Dict[str, Any] = Body(...),
+        request_data: OrchestrateRequest,
         user_id: Optional[str] = Depends(get_current_user)
     ):
         """
         Orchestrate full AI workflow with SSE streaming.
 
         Phase 3.4: Orchestrator + SSE - Full AI orchestration with real-time progress updates.
-
-        - **user_request**: Natural language task description
-        - **stream**: Enable SSE streaming (default: true)
 
         SSE Events:
         - **plan_init**: Initial plan with steps
@@ -4063,14 +4254,8 @@ def api():
             )
 
         try:
-            user_request = request_data.get("user_request")
-            stream_mode = request_data.get("stream", True)
-
-            if not user_request:
-                return JSONResponse(
-                    status_code=400,
-                    content={"success": False, "error": "Missing required field: user_request"}
-                )
+            user_request = request_data.user_request
+            stream_mode = request_data.stream
 
             # Quota enforcement for authenticated users
             if user_id:
@@ -4258,27 +4443,18 @@ def api():
 
     @web_app.post("/workflow/generate", tags=["Workflows"])
     async def workflow_generate_route(
-        request_data: Dict[str, Any],
+        request_data: WorkflowGenerateRequest,
         user_id: Optional[str] = Depends(get_current_user)
     ):
         """
         Generate workflow JSON from natural language using AI.
 
-        - **user_request**: Natural language description of workflow
-        - **save_as**: Optional workflow name to save after generation
-
         Returns:
             Generated workflow JSON with validation
         """
         try:
-            user_request = request_data.get("user_request")
-            save_as = request_data.get("save_as")
-
-            if not user_request:
-                return JSONResponse(
-                    status_code=400,
-                    content={"success": False, "error": "Missing required field: user_request"}
-                )
+            user_request = request_data.user_request
+            save_as = request_data.save_as
 
             # Load system documentation from database
             from supabase import create_client
@@ -4706,14 +4882,11 @@ Return ONLY the JSON workflow object, no markdown code blocks or explanations.""
 
     @web_app.post("/enrich", tags=["Bulk Processing"])
     async def multi_tool_enrich(
-        request_data: Dict[str, Any],
+        request_data: EnrichRequest,
         user_id: Optional[str] = Depends(get_current_user)
     ):
         """
         Enrich a single record with multiple tools.
-
-        - **data**: Record to enrich (dict with any fields)
-        - **tools**: List of tool names to apply (e.g. ["phone-validation", "email-intel"])
         """
         start_time = time.time()
 
@@ -4721,15 +4894,15 @@ Return ONLY the JSON workflow object, no markdown code blocks or explanations.""
         if user_id:
             check_quota(user_id)
 
-        data = request_data.get("data")
-        tool_names = request_data.get("tools", [])
+        data = request_data.data
+        tool_names = request_data.tools
 
-        if not data or not isinstance(data, dict):
+        if not isinstance(data, dict):
             error_response = {"success": False, "error": "data required (must be dict)"}
             log_api_call(
                 tool_name="enrich",
                 tool_type="enrichment",
-                input_data=request_data,
+                input_data=request_data.model_dump(),
                 output_data=error_response,
                 success=False,
                 processing_ms=int((time.time() - start_time) * 1000),
@@ -4813,13 +4986,11 @@ Return ONLY the JSON workflow object, no markdown code blocks or explanations.""
 
     @web_app.post("/enrich/auto", tags=["Bulk Processing"])
     async def auto_enrich(
-        request_data: Dict[str, Any],
+        request_data: EnrichAutoRequest,
         user_id: Optional[str] = Depends(get_current_user)
     ):
         """
         Auto-detect and enrich a single record with appropriate tools.
-
-        - **data**: Record to enrich (dict with any fields)
         """
         start_time = time.time()
 
@@ -4827,13 +4998,13 @@ Return ONLY the JSON workflow object, no markdown code blocks or explanations.""
         if user_id:
             check_quota(user_id)
 
-        data = request_data.get("data")
-        if not data or not isinstance(data, dict):
+        data = request_data.data
+        if not isinstance(data, dict):
             error_response = {"success": False, "error": "data required (must be dict)"}
             log_api_call(
                 tool_name="enrich-auto",
                 tool_type="enrichment",
-                input_data=request_data,
+                input_data=request_data.model_dump(),
                 output_data=error_response,
                 success=False,
                 processing_ms=int((time.time() - start_time) * 1000),
@@ -4888,7 +5059,7 @@ Return ONLY the JSON workflow object, no markdown code blocks or explanations.""
 
     @web_app.post("/bulk", tags=["Bulk Processing"])
     async def bulk_process(
-        request_data: Dict[str, Any],
+        request_data: BulkProcessRequest,
         user_id: Optional[str] = Depends(get_current_user)
     ):
         """
@@ -4902,51 +5073,9 @@ Return ONLY the JSON workflow object, no markdown code blocks or explanations.""
         """
         start_time = time.time()
 
-        rows = request_data.get("rows", [])
-        tool_names = request_data.get("tools", [])
-        webhook_url = request_data.get("webhook_url")
-
-        if not rows or not isinstance(rows, list):
-            error_response = {"success": False, "error": "rows required (must be list)"}
-            log_api_call(
-                tool_name="bulk",
-                tool_type="enrichment",
-                input_data={"rows_count": 0},
-                output_data=error_response,
-                success=False,
-                processing_ms=int((time.time() - start_time) * 1000),
-                user_id=user_id,
-                error_message="rows required (must be list)"
-            )
-            return JSONResponse(status_code=400, content=error_response)
-
-        if len(rows) > 10000:
-            error_response = {"success": False, "error": "Maximum 10,000 rows per batch"}
-            log_api_call(
-                tool_name="bulk",
-                tool_type="enrichment",
-                input_data={"rows_count": len(rows)},
-                output_data=error_response,
-                success=False,
-                processing_ms=int((time.time() - start_time) * 1000),
-                user_id=user_id,
-                error_message="Maximum 10,000 rows exceeded"
-            )
-            return JSONResponse(status_code=400, content=error_response)
-
-        if not tool_names or not isinstance(tool_names, list):
-            error_response = {"success": False, "error": "tools required (must be list)"}
-            log_api_call(
-                tool_name="bulk",
-                tool_type="enrichment",
-                input_data={"rows_count": len(rows)},
-                output_data=error_response,
-                success=False,
-                processing_ms=int((time.time() - start_time) * 1000),
-                user_id=user_id,
-                error_message="tools required (must be list)"
-            )
-            return JSONResponse(status_code=400, content=error_response)
+        rows = request_data.rows
+        tool_names = request_data.tools
+        webhook_url = request_data.webhook_url
 
         # Quota enforcement: Bulk = N API calls (one per row)
         if user_id:
@@ -4999,7 +5128,7 @@ Return ONLY the JSON workflow object, no markdown code blocks or explanations.""
 
     @web_app.post("/bulk/auto", tags=["Bulk Processing"])
     async def bulk_auto_process(
-        request_data: Dict[str, Any],
+        request_data: BulkAutoProcessRequest,
         user_id: Optional[str] = Depends(get_current_user)
     ):
         """
@@ -5012,36 +5141,8 @@ Return ONLY the JSON workflow object, no markdown code blocks or explanations.""
         """
         start_time = time.time()
 
-        rows = request_data.get("rows", [])
-        webhook_url = request_data.get("webhook_url")
-
-        if not rows or not isinstance(rows, list):
-            error_response = {"success": False, "error": "rows required (must be list)"}
-            log_api_call(
-                tool_name="bulk-auto",
-                tool_type="enrichment",
-                input_data={"rows_count": 0},
-                output_data=error_response,
-                success=False,
-                processing_ms=int((time.time() - start_time) * 1000),
-                user_id=user_id,
-                error_message="rows required (must be list)"
-            )
-            return JSONResponse(status_code=400, content=error_response)
-
-        if len(rows) > 10000:
-            error_response = {"success": False, "error": "Maximum 10,000 rows per batch"}
-            log_api_call(
-                tool_name="bulk-auto",
-                tool_type="enrichment",
-                input_data={"rows_count": len(rows)},
-                output_data=error_response,
-                success=False,
-                processing_ms=int((time.time() - start_time) * 1000),
-                user_id=user_id,
-                error_message="Maximum 10,000 rows exceeded"
-            )
-            return JSONResponse(status_code=400, content=error_response)
+        rows = request_data.rows
+        webhook_url = request_data.webhook_url
 
         # Quota enforcement: Bulk = N API calls (one per row)
         if user_id:
@@ -5160,7 +5261,7 @@ Return ONLY the JSON workflow object, no markdown code blocks or explanations.""
 
     @web_app.post("/jobs/saved", tags=["Saved Jobs"])
     async def create_saved_job(
-        job_data: Dict[str, Any] = Body(...),
+        job_data: SavedJobCreateRequest,
         user_id: Optional[str] = Depends(get_current_user)
     ):
         """
@@ -5174,18 +5275,8 @@ Return ONLY the JSON workflow object, no markdown code blocks or explanations.""
         if not user_id:
             return JSONResponse(status_code=401, content={"success": False, "error": "Authentication required"})
 
-        # Validate required fields
-        if not job_data.get("name"):
-            return JSONResponse(status_code=400, content={"success": False, "error": "name is required"})
-
-        if not job_data.get("tool_name"):
-            return JSONResponse(status_code=400, content={"success": False, "error": "tool_name is required"})
-
-        if not job_data.get("params") or not isinstance(job_data.get("params"), dict):
-            return JSONResponse(status_code=400, content={"success": False, "error": "params required (must be dict)"})
-
         # Verify tool exists
-        tool_name = job_data["tool_name"]
+        tool_name = job_data.tool_name
         if tool_name not in TOOLS:
             return JSONResponse(status_code=400, content={"success": False, "error": f"Tool '{tool_name}' not found"})
 
@@ -5202,12 +5293,12 @@ Return ONLY the JSON workflow object, no markdown code blocks or explanations.""
             # Insert saved job
             result = supabase.table("saved_queries").insert({
                 "user_id": user_id,
-                "name": job_data["name"],
-                "description": job_data.get("description"),
+                "name": job_data.name,
+                "description": job_data.description,
                 "tool_name": tool_name,
-                "params": job_data["params"],
-                "is_template": job_data.get("is_template", False),
-                "template_vars": job_data.get("template_vars")
+                "params": job_data.params,
+                "is_template": job_data.is_template,
+                "template_vars": job_data.template_vars
             }).execute()
 
             if result.data:
@@ -5353,7 +5444,7 @@ Return ONLY the JSON workflow object, no markdown code blocks or explanations.""
     @web_app.patch("/jobs/saved/{job_id}/schedule", tags=["Saved Jobs"])
     async def update_job_schedule(
         job_id: str,
-        schedule_data: Dict[str, Any] = Body(...),
+        schedule_data: JobScheduleUpdateRequest,
         user_id: Optional[str] = Depends(get_current_user)
     ):
         """
@@ -5366,28 +5457,17 @@ Return ONLY the JSON workflow object, no markdown code blocks or explanations.""
         if not user_id:
             return JSONResponse(status_code=401, content={"success": False, "error": "Authentication required"})
 
-        is_scheduled = schedule_data.get("is_scheduled")
-        schedule_preset = schedule_data.get("schedule_preset")
-        schedule_cron = schedule_data.get("schedule_cron")
+        is_scheduled = schedule_data.is_scheduled
+        schedule_preset = schedule_data.schedule_preset
+        schedule_cron = schedule_data.schedule_cron
 
-        # Validation
-        if is_scheduled is None:
-            return JSONResponse(status_code=400, content={"success": False, "error": "is_scheduled is required"})
-
-        if not isinstance(is_scheduled, bool):
-            return JSONResponse(status_code=400, content={"success": False, "error": "is_scheduled must be boolean"})
-
-        # If enabling scheduling, require exactly one schedule type
+        # Custom validation: mutual exclusivity and requirement logic
         if is_scheduled:
             if not schedule_preset and not schedule_cron:
                 return JSONResponse(status_code=400, content={"success": False, "error": "schedule_preset or schedule_cron required when enabling scheduling"})
 
             if schedule_preset and schedule_cron:
                 return JSONResponse(status_code=400, content={"success": False, "error": "Cannot set both schedule_preset and schedule_cron"})
-
-            # Validate preset values
-            if schedule_preset and schedule_preset not in ['daily', 'weekly', 'monthly']:
-                return JSONResponse(status_code=400, content={"success": False, "error": "schedule_preset must be 'daily', 'weekly', or 'monthly'"})
 
             # Cron validation (placeholder for future)
             if schedule_cron:
